@@ -444,6 +444,31 @@ func TestLoadNotExist(t *testing.T) {
 	}
 }
 
+func TestUsedBytes(t *testing.T) {
+	idx := New(4096)
+	n := now()
+
+	if idx.UsedBytes() != 0 {
+		t.Errorf("UsedBytes on empty index: got %d, want 0", idx.UsedBytes())
+	}
+
+	ino1, _ := idx.CreateInode(Regular, 0o644, 0, 0, 0, n)
+	idx.AddDirEntry(RootIno, "a.txt", ino1, n)
+	idx.WriteExtent(ino1, Extent{ChunkID: "c0", ChunkOffset: 0, Length: 1000, FileOffset: 0}, n)
+
+	ino2, _ := idx.CreateInode(Regular, 0o644, 0, 0, 0, n)
+	idx.AddDirEntry(RootIno, "b.txt", ino2, n)
+	idx.WriteExtent(ino2, Extent{ChunkID: "c0", ChunkOffset: 1000, Length: 500, FileOffset: 0}, n)
+
+	// Directories should not count towards used bytes.
+	dirIno, _ := idx.CreateInode(Directory, 0o755, 0, 0, 0, n)
+	idx.AddDirEntry(RootIno, "dir", dirIno, n)
+
+	if got := idx.UsedBytes(); got != 1500 {
+		t.Errorf("UsedBytes: got %d, want 1500", got)
+	}
+}
+
 func TestReaddir(t *testing.T) {
 	idx := New(4096)
 	n := now()

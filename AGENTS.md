@@ -60,6 +60,9 @@ internal/
 8. **Environment variables** (all prefixed `FUSEY_`):
    - `FUSEY_CHUNK_SIZE` (default 64 MiB) — max chunk object size
    - `FUSEY_BLOCK_SIZE` (default 4096) — blksize reported to kernel
+   - `FUSEY_MAX_SIZE` (default 1 TiB) — total filesystem capacity in bytes,
+     reported to the kernel via `statfs`. Free space = MaxFSSize − usedBytes.
+     Must be > 0. Set to expected max data size per instance (e.g. 25 GiB).
    - `FUSEY_CACHE_DIR` (default `/var/cache/fusey`) — on-disk index cache
    - `FUSEY_BUCKET` — S3 bucket name (required)
    - `FUSEY_ENDPOINT` — S3 endpoint URL (required)
@@ -74,6 +77,7 @@ internal/
    - `activeChunkBound`: active chunk size <= FUSEY_CHUNK_SIZE
    - `lastExtentReadable`: last written extent is always within its chunk's bounds
    - `allLiveExtentsPreserved` (compaction): no live extent lost during compaction
+   - `usedWithinBound`: sum of all regular-file sizes <= FUSEY_MAX_SIZE
 
 10. **Crash safety** (from compaction.qnt commitCompaction):
     - Index must be persisted before old chunks are deleted

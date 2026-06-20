@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	DefaultChunkSize           int64         = 64 * 1024 * 1024 // 64 MiB
+	DefaultChunkSize           int64         = 64 * 1024 * 1024  // 64 MiB
 	DefaultBlockSize           int32         = 4096
+	DefaultMaxFSSize           int64         = 1024 * 1024 * 1024 * 1024 // 1 TiB
 	DefaultCacheDir                          = "/var/cache/fusey"
 	DefaultCompactionThreshold float64       = 0.3
 	DefaultCompactionInterval  time.Duration = 5 * time.Minute
@@ -22,6 +23,9 @@ type Config struct {
 	ChunkSize int64
 	// BlockSize is the preferred I/O block size reported to the kernel (FUSEY_BLOCK_SIZE).
 	BlockSize int32
+	// MaxFSSize is the total capacity of the filesystem in bytes reported to the
+	// kernel via statfs (FUSEY_MAX_SIZE). Free space = MaxFSSize - used bytes.
+	MaxFSSize int64
 	// CacheDir is the directory used for the on-disk index cache (FUSEY_CACHE_DIR).
 	CacheDir string
 	// Bucket is the object store bucket name (FUSEY_BUCKET).
@@ -43,6 +47,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		ChunkSize:           DefaultChunkSize,
 		BlockSize:           DefaultBlockSize,
+		MaxFSSize:           DefaultMaxFSSize,
 		CacheDir:            DefaultCacheDir,
 		Bucket:              os.Getenv("FUSEY_BUCKET"),
 		Endpoint:            os.Getenv("FUSEY_ENDPOINT"),
@@ -56,6 +61,12 @@ func Load() (*Config, error) {
 	}
 	if err := parseInt32Env("FUSEY_BLOCK_SIZE", &cfg.BlockSize); err != nil {
 		return nil, err
+	}
+	if err := parseInt64Env("FUSEY_MAX_SIZE", &cfg.MaxFSSize); err != nil {
+		return nil, err
+	}
+	if cfg.MaxFSSize <= 0 {
+		return nil, fmt.Errorf("FUSEY_MAX_SIZE must be > 0")
 	}
 	if v := os.Getenv("FUSEY_CACHE_DIR"); v != "" {
 		cfg.CacheDir = v
