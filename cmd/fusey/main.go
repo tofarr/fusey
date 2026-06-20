@@ -156,6 +156,9 @@ func mustBuildStore(ctx context.Context, cfg *config.Config) (chunks.ObjectStore
 		objStore = s3store
 	}
 	cs = chunks.NewChunkStore(objStore, cfg.ChunkSize)
+	if err := cs.RecoverNextSeq(ctx); err != nil {
+		log.Fatalf("recover chunk sequence: %v", err)
+	}
 	if err := cs.SetCacheDir(cfg.CacheDir); err != nil {
 		log.Fatalf("chunk cache: %v", err)
 	}
