@@ -1,0 +1,27 @@
+# Binaries
+fusey
+/bin/
+
+# Go build cache
+*.test
+*.out
+
+# Dependency vendor directory (we use go modules)
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime
+*.log
+/var/
+
+# Quint
+.quint_cache/
