@@ -117,6 +117,9 @@ func (cs *ChunkStore) sealLocked(ctx context.Context) error {
 		cs.nextSeq++
 		return nil
 	}
+	// Delete before put: FlushActive may have already written a partial
+	// version of this chunk; overwrite it with the full buffer.
+	_ = cs.store.Delete(ctx, cs.activeID)
 	if err := cs.store.Put(ctx, cs.activeID, cs.activeBuf); err != nil {
 		return fmt.Errorf("seal chunk %s: %w", cs.activeID, err)
 	}

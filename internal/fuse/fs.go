@@ -24,12 +24,14 @@ const (
 type Fusey struct {
 	idx       *index.Index
 	cs        *chunks.ChunkStore
-	maxFSSize int64 // total capacity in bytes, reported via statfs
+	maxFSSize int64  // total capacity in bytes, reported via statfs
+	cacheDir  string // directory where index snapshots are persisted on Fsync
 }
 
-// New creates a Fusey filesystem. maxFSSize is the value of FUSEY_MAX_SIZE.
-func New(idx *index.Index, cs *chunks.ChunkStore, maxFSSize int64) *Fusey {
-	return &Fusey{idx: idx, cs: cs, maxFSSize: maxFSSize}
+// New creates a Fusey filesystem.
+// maxFSSize is FUSEY_MAX_SIZE; cacheDir is FUSEY_CACHE_DIR.
+func New(idx *index.Index, cs *chunks.ChunkStore, maxFSSize int64, cacheDir string) *Fusey {
+	return &Fusey{idx: idx, cs: cs, maxFSSize: maxFSSize, cacheDir: cacheDir}
 }
 
 // Root returns the root node for mounting.
@@ -420,6 +422,7 @@ type FileHandle struct {
 var _ fs.FileReader  = (*FileHandle)(nil)
 var _ fs.FileWriter  = (*FileHandle)(nil)
 var _ fs.FileFlusher = (*FileHandle)(nil)
+var _ fs.FileFsyncer = (*FileHandle)(nil)
 
 func (fh *FileHandle) Read(ctx context.Context, dest []byte, off int64) (gofuse.ReadResult, syscall.Errno) {
 	inode, ok := fh.f.idx.GetInode(fh.ino)
@@ -462,6 +465,22 @@ func (fh *FileHandle) Read(ctx context.Context, dest []byte, off int64) (gofuse.
 
 func (fh *FileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	now := time.Now().UnixNano()
+
+	// ENOSPC: only charge for bytes that extend the file beyond its current end.
+	// Overwrites at existing offsets don't change the logical size and are always
+	// allowed, matching POSIX behaviour for filesystems near capacity.
+	inode, ok := fh.f.idx.GetInode(fh.ino)
+	if !ok {
+		return 0, syscall.ENOENT
+	}
+	newEnd := off + int64(len(data))
+	if newEnd > inode.Size {
+		delta := newEnd - inode.Size
+		if fh.f.idx.UsedBytes()+delta > fh.f.maxFSSize {
+			return 0, syscall.ENOSPC
+		}
+	}
+
 	ext, err := fh.f.cs.Append(ctx, data, off)
 	if err != nil {
 		return 0, syscall.EIO
@@ -473,6 +492,25 @@ func (fh *FileHandle) Write(ctx context.Context, data []byte, off int64) (uint32
 }
 
 func (fh *FileHandle) Flush(ctx context.Context) syscall.Errno {
+	return 0
+}
+
+// Fsync makes the file's data durable:
+//  1. Flush the in-memory active chunk to the backing store so all written
+//     bytes are retrievable without relying on the process staying alive.
+//  2. Persist the index snapshot to cacheDir so the file-to-extent mapping
+//     survives a restart.
+//
+// Both operations are idempotent; calling Fsync multiple times is safe.
+func (fh *FileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+	if err := fh.f.cs.FlushActive(ctx); err != nil {
+		return syscall.EIO
+	}
+	if fh.f.cacheDir != "" {
+		if err := index.Save(fh.f.idx, fh.f.cacheDir); err != nil {
+			return syscall.EIO
+		}
+	}
 	return 0
 }
 

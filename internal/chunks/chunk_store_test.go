@@ -203,3 +203,45 @@ func TestTooBigForChunk(t *testing.T) {
 		t.Error("expected error appending data larger than maxChunkSize")
 	}
 }
+
+// TestSealAfterFlushActive reproduces the bug where sealLocked would fail
+// because FlushActive had already PUT the same chunk ID to the store.
+// After the fix (delete-before-put in sealLocked) the full buffer must be
+// readable from the sealed chunk.
+func TestSealAfterFlushActive(t *testing.T) {
+	ctx := context.Background()
+	_, cs := newTestStore(t)
+
+	first := []byte("first write")
+	ext, err := cs.Append(ctx, first, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkID := ext.ChunkID
+
+	// Flush active — writes "first write" to the store but keeps the active buffer.
+	if err := cs.FlushActive(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Append more data into the same active chunk.
+	second := []byte(" second write")
+	if _, err := cs.Append(ctx, second, int64(len(first))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seal — must overwrite the partial store version with the full buffer.
+	if err := cs.Seal(ctx); err != nil {
+		t.Fatalf("Seal after FlushActive: %v", err)
+	}
+
+	// The sealed chunk must contain the complete data (first + second).
+	want := append(first, second...)
+	got, err := cs.Read(ctx, chunkID, 0, int64(len(want)))
+	if err != nil {
+		t.Fatalf("Read sealed chunk: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("sealed chunk: got %q, want %q", got, want)
+	}
+}
