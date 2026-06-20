@@ -8,12 +8,13 @@ import (
 )
 
 const (
-	DefaultChunkSize           int64         = 64 * 1024 * 1024  // 64 MiB
+	DefaultChunkSize           int64         = 64 * 1024 * 1024       // 64 MiB
 	DefaultBlockSize           int32         = 4096
 	DefaultMaxFSSize           int64         = 1024 * 1024 * 1024 * 1024 // 1 TiB
 	DefaultCacheDir                          = "/var/cache/fusey"
 	DefaultCompactionThreshold float64       = 0.3
 	DefaultPersistInterval     time.Duration = 30 * time.Second
+	DefaultBrokerAuthHeader                  = "X-SESSION-API-KEY"
 )
 
 // Config holds all runtime configuration resolved from FUSEY_* environment variables.
@@ -50,6 +51,21 @@ type Config struct {
 	// Chunks are stored as {Prefix}chunk-XXXXXXXX; the index as {Prefix}index.json.
 	Prefix string
 
+	// --- Broker store (alternative to direct S3) ---
+
+	// BrokerURL is the base URL of the broker service (FUSEY_BROKER_URL).
+	// When set, BrokerStore is used for all object operations instead of S3Store.
+	// The broker holds object-store credentials; fusey authenticates with a
+	// bearer token and never contacts the object store directly.
+	// Example: "https://broker.internal/fusey"
+	BrokerURL string
+	// BrokerAuthHeader is the HTTP header name sent on every broker request
+	// (FUSEY_BROKER_AUTH_HEADER, default "X-SESSION-API-KEY").
+	BrokerAuthHeader string
+	// BrokerAuthValue is the token value for the auth header
+	// (FUSEY_BROKER_AUTH_VALUE).
+	BrokerAuthValue string
+
 	// --- Background tasks ---
 
 	// CompactionThreshold is the orphan fraction above which a chunk is selected
@@ -73,8 +89,14 @@ func Load() (*Config, error) {
 		AccessKey:           os.Getenv("FUSEY_ACCESS_KEY"),
 		SecretKey:           os.Getenv("FUSEY_SECRET_KEY"),
 		Prefix:              os.Getenv("FUSEY_PREFIX"),
+		BrokerURL:           os.Getenv("FUSEY_BROKER_URL"),
+		BrokerAuthHeader:    DefaultBrokerAuthHeader,
+		BrokerAuthValue:     os.Getenv("FUSEY_BROKER_AUTH_VALUE"),
 		CompactionThreshold: DefaultCompactionThreshold,
 		PersistInterval:     DefaultPersistInterval,
+	}
+	if v := os.Getenv("FUSEY_BROKER_AUTH_HEADER"); v != "" {
+		cfg.BrokerAuthHeader = v
 	}
 	if v := os.Getenv("FUSEY_REGION"); v != "" {
 		cfg.Region = v

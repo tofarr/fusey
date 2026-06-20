@@ -198,7 +198,19 @@ as a Kubernetes container without config files.
 | `FUSEY_FORCE_PATH_STYLE` | `false` | Set `true` for MinIO and most self-hosted S3-compatible stores that require path-style URLs |
 | `FUSEY_PREFIX` | _(none)_ | Key prefix for all objects in the bucket (e.g. `pod-abc/`). Use this to share one bucket across multiple Fusey instances |
 | `FUSEY_COMPACTION_THRESHOLD` | `0.3` | Orphan fraction above which a chunk is targeted by `fusey compact` |
-| `FUSEY_PERSIST_INTERVAL` | `30s` | How often the index is flushed to disk and S3 |
+| `FUSEY_PERSIST_INTERVAL` | `30s` | How often the index is flushed to disk and the object store |
+
+### Broker store (alternative to direct S3)
+
+When `FUSEY_BROKER_URL` is set, fusey uses a **BrokerStore** instead of talking directly to S3. The broker is a trusted HTTP service that holds object-store credentials; fusey authenticates with a single bearer token and never contacts S3 directly. This is the recommended model for multi-tenant deployments where app containers are untrusted.
+
+| Variable | Default | Description |
+|---|---|---|
+| `FUSEY_BROKER_URL` | _(none)_ | Base URL of the broker service. When set, overrides all S3 config |
+| `FUSEY_BROKER_AUTH_HEADER` | `X-SESSION-API-KEY` | HTTP header name sent on every broker request |
+| `FUSEY_BROKER_AUTH_VALUE` | _(none)_ | Auth token value — required when `FUSEY_BROKER_URL` is set |
+
+A reference broker implementation is in [`broker/`](broker/). It stores objects in a local directory and is suitable for local testing and development. See [`broker/main.py`](broker/main.py) for the full HTTP API contract.
 
 ## Project status
 
