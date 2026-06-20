@@ -45,6 +45,41 @@ func NewChunkStore(store Store, maxChunkSize int64) *ChunkStore {
 	return cs
 }
 
+// RecoverNextSeq scans the backing store for existing chunk IDs and advances
+// nextSeq past the highest one found. This prevents a new session from
+// opening an active chunk whose ID aliases a sealed chunk written by a
+// previous session, which would cause reads of that chunk to hit the new
+// (empty) active buffer instead of the store or the local cache.
+//
+// Call once after NewChunkStore before the first Append or Read. On a
+// genuinely fresh filesystem with no existing chunks this is a no-op.
+// Non-chunk object IDs (compacted-*, index.json) are ignored.
+func (cs *ChunkStore) RecoverNextSeq(ctx context.Context) error {
+	ids, err := cs.store.List(ctx)
+	if err != nil {
+		return fmt.Errorf("recover next seq: %w", err)
+	}
+
+	maxSeq := -1
+	for _, id := range ids {
+		var seq int
+		if n, _ := fmt.Sscanf(id, "chunk-%08d", &seq); n == 1 && seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+
+	if maxSeq < 0 {
+		return nil // no existing chunks; keep the default initialisation
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.nextSeq = maxSeq + 1
+	cs.activeID = cs.chunkID(cs.nextSeq)
+	cs.nextSeq++
+	return nil
+}
+
 // SetCacheDir enables local disk caching of sealed chunks under baseDir/chunks/.
 // The directory is created if it does not exist. Once enabled, sealed chunk
 // reads are served from disk on a cache hit; on a miss the full chunk is

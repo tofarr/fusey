@@ -78,13 +78,6 @@ func TestCacheHitAfterSeal(t *testing.T) {
 // TestCacheMissFetchesFullChunk verifies that when a sealed chunk is not in
 // the local cache, the full chunk is fetched from the store exactly once, then
 // cached so the second read does not touch the store.
-//
-// The chunk size is set to 10 bytes so that writing 11 bytes forces an
-// auto-rotation: chunk-00000000 is sealed automatically and the second
-// write lands in chunk-00000001. A fresh ChunkStore always starts with
-// activeID = "chunk-00000000", so using chunk-00000001 as the test target
-// avoids the active-ID collision that would cause a spurious out-of-bounds
-// error.
 func TestCacheMissFetchesFullChunk(t *testing.T) {
 	ctx := context.Background()
 
@@ -94,29 +87,26 @@ func TestCacheMissFetchesFullChunk(t *testing.T) {
 	}
 	spy := &spyStore{Store: local}
 
-	// cs1: no cache. Write 10 bytes to fill chunk-00000000, then 1 byte to
-	// trigger auto-rotation into chunk-00000001. Seal explicitly so both
-	// chunks are in the store.
-	cs1 := NewChunkStore(spy, 10)
-	cs1.Append(ctx, bytes.Repeat([]byte("x"), 10), 0) // fills chunk-00000000
-	target := bytes.Repeat([]byte("ab"), 5)           // 10 bytes going into chunk-00000001
-	ext, _ := cs1.Append(ctx, target, 10)             // auto-rotates, writes to chunk-00000001
+	// cs1: write and seal without a cache so the chunk lands in the store only.
+	cs1 := NewChunkStore(spy, 1024)
+	target := bytes.Repeat([]byte("ab"), 20) // 40 bytes
+	ext, _ := cs1.Append(ctx, target, 0)
 	cs1.Seal(ctx)
 
-	if ext.ChunkID != "chunk-00000001" {
-		t.Fatalf("expected ext in chunk-00000001, got %s", ext.ChunkID)
+	// cs2: fresh ChunkStore + cache. RecoverNextSeq advances its activeID
+	// past chunk-00000000, preventing the ID collision that would otherwise
+	// cause Read to hit the empty active buffer instead of the store.
+	cs2 := NewChunkStore(spy, 1024)
+	if err := cs2.RecoverNextSeq(ctx); err != nil {
+		t.Fatalf("RecoverNextSeq: %v", err)
 	}
-
-	// cs2: fresh ChunkStore + cache. Its activeID = "chunk-00000000",
-	// which does not conflict with chunk-00000001.
-	cs2 := NewChunkStore(spy, 10)
 	if err := cs2.SetCacheDir(t.TempDir()); err != nil {
 		t.Fatalf("SetCacheDir: %v", err)
 	}
 
 	spy.getRangeCalls.Store(0)
 
-	// First read: cache miss — should fetch from store.
+	// First read: cache miss — should fetch from store (1 GetRange call).
 	got, err := cs2.Read(ctx, ext.ChunkID, ext.ChunkOffset, ext.Length)
 	if err != nil {
 		t.Fatalf("first Read: %v", err)
@@ -131,12 +121,12 @@ func TestCacheMissFetchesFullChunk(t *testing.T) {
 	spy.getRangeCalls.Store(0)
 
 	// Second read: cache hit — store must not be called again.
-	got2, err := cs2.Read(ctx, ext.ChunkID, 0, 4) // partial range
+	got2, err := cs2.Read(ctx, ext.ChunkID, 0, 10) // partial range
 	if err != nil {
 		t.Fatalf("second Read: %v", err)
 	}
-	if !bytes.Equal(got2, target[:4]) {
-		t.Errorf("second read data mismatch: got %q, want %q", got2, target[:4])
+	if !bytes.Equal(got2, target[:10]) {
+		t.Errorf("second read data mismatch: got %q, want %q", got2, target[:10])
 	}
 	if spy.getRangeCalls.Load() != 0 {
 		t.Errorf("second read should be a cache hit (0 store calls), got %d", spy.getRangeCalls.Load())
@@ -157,18 +147,17 @@ func TestCacheConcurrentMissDeduplicates(t *testing.T) {
 	}
 	spy := &spyStore{Store: local}
 
-	// Force chunk-00000001 to contain the data we want to test.
-	cs1 := NewChunkStore(spy, 10)
-	cs1.Append(ctx, bytes.Repeat([]byte("x"), 10), 0) // fills chunk-00000000
-	data := bytes.Repeat([]byte("y"), 10)
-	ext, _ := cs1.Append(ctx, data, 10) // chunk-00000001
+	cs1 := NewChunkStore(spy, 1024)
+	data := bytes.Repeat([]byte("y"), 100)
+	ext, _ := cs1.Append(ctx, data, 0)
 	cs1.Seal(ctx)
 
-	if ext.ChunkID != "chunk-00000001" {
-		t.Fatalf("expected chunk-00000001, got %s", ext.ChunkID)
+	// cs2: RecoverNextSeq prevents the active-ID collision so all 50 goroutines
+	// correctly route to the cache/store path rather than the active buffer.
+	cs2 := NewChunkStore(spy, 1024)
+	if err := cs2.RecoverNextSeq(ctx); err != nil {
+		t.Fatalf("RecoverNextSeq: %v", err)
 	}
-
-	cs2 := NewChunkStore(spy, 10)
 	if err := cs2.SetCacheDir(t.TempDir()); err != nil {
 		t.Fatalf("SetCacheDir: %v", err)
 	}
@@ -238,8 +227,7 @@ func TestCacheReadPartialRanges(t *testing.T) {
 
 // TestCachePersistsAcrossChunkStoreRestart simulates a pod restart: a chunk
 // sealed in the first ChunkStore session should be served from the on-disk
-// cache in the second session without calling the backing store. Uses
-// chunk-00000001 to avoid active-ID collision (see TestCacheMissFetchesFullChunk).
+// cache in the second session without calling the backing store.
 func TestCachePersistsAcrossChunkStoreRestart(t *testing.T) {
 	ctx := context.Background()
 
@@ -250,24 +238,22 @@ func TestCachePersistsAcrossChunkStoreRestart(t *testing.T) {
 	spy := &spyStore{Store: local}
 	cacheDir := t.TempDir()
 
-	// Session 1: fill chunk-00000000 to trigger rotation, write target data
-	// into chunk-00000001, seal. Both chunks land in the cache.
-	cs1 := NewChunkStore(spy, 10)
+	// Session 1: write and seal — chunk lands in the store and the local cache.
+	cs1 := NewChunkStore(spy, 1024)
 	if err := cs1.SetCacheDir(cacheDir); err != nil {
 		t.Fatalf("SetCacheDir: %v", err)
 	}
-	cs1.Append(ctx, bytes.Repeat([]byte("x"), 10), 0) // chunk-00000000
-	data := []byte("persistent")                       // 10 bytes → chunk-00000001
-	ext, _ := cs1.Append(ctx, data, 10)
+	data := []byte("persistent data across restarts")
+	ext, _ := cs1.Append(ctx, data, 0)
 	cs1.Seal(ctx)
 
-	if ext.ChunkID != "chunk-00000001" {
-		t.Fatalf("expected chunk-00000001, got %s", ext.ChunkID)
-	}
-
-	// Session 2: fresh ChunkStore, same cache dir, store calls reset to 0.
+	// Session 2: fresh ChunkStore, same cache dir. RecoverNextSeq advances
+	// activeID so chunk-00000000 is not mistaken for the new empty active chunk.
 	spy.getRangeCalls.Store(0)
-	cs2 := NewChunkStore(spy, 10)
+	cs2 := NewChunkStore(spy, 1024)
+	if err := cs2.RecoverNextSeq(ctx); err != nil {
+		t.Fatalf("RecoverNextSeq: %v", err)
+	}
 	if err := cs2.SetCacheDir(cacheDir); err != nil {
 		t.Fatalf("SetCacheDir session 2: %v", err)
 	}
