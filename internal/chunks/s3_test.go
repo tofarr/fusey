@@ -11,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // s3TestStore returns an S3Store pointed at a real S3-compatible endpoint, or
@@ -45,6 +46,20 @@ func s3TestStore(t *testing.T) *S3Store {
 	)
 	if err != nil {
 		t.Fatalf("NewS3Store: %v", err)
+	}
+
+	// Create the bucket if it does not already exist. MinIO does not create
+	// buckets automatically, so the first test run against a fresh instance
+	// would fail with NoSuchBucket without this step.
+	_, cerr := store.client.CreateBucket(context.Background(), &s3.CreateBucketInput{
+		Bucket: aws.String(bucket),
+	})
+	if cerr != nil {
+		var alreadyExists *types.BucketAlreadyExists
+		var alreadyOwned *types.BucketAlreadyOwnedByYou
+		if !errors.As(cerr, &alreadyExists) && !errors.As(cerr, &alreadyOwned) {
+			t.Fatalf("CreateBucket %q: %v", bucket, cerr)
+		}
 	}
 	return store
 }
