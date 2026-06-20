@@ -7,8 +7,9 @@ package chunks
 import "context"
 
 // Store is the abstract backing store for chunk objects.
-// Implementations include a local filesystem store (for testing) and an S3
-// store (for production). All methods must be safe for concurrent use.
+// Implementations include a local filesystem store (for testing), an S3
+// store (for production), and a BrokerStore (for multi-tenant deployments).
+// All methods must be safe for concurrent use.
 type Store interface {
 	// Put writes data as a new immutable object with the given id.
 	// It is an error to call Put with an id that already exists.
@@ -25,4 +26,21 @@ type Store interface {
 
 	// Size returns the total byte count of the object with id.
 	Size(ctx context.Context, id string) (int64, error)
+}
+
+// ObjectStore extends Store with index persistence operations.
+// Both S3Store and BrokerStore implement this interface; main.go uses it to
+// avoid a concrete dependency on either implementation.
+type ObjectStore interface {
+	Store
+
+	// PutRaw writes raw bytes to an arbitrary key (e.g. the index object).
+	PutRaw(ctx context.Context, key string, data []byte) error
+
+	// GetRaw reads the full content of an arbitrary key.
+	// Returns ErrNotFound if the key does not exist.
+	GetRaw(ctx context.Context, key string) ([]byte, error)
+
+	// IndexKey returns the key used to store the filesystem index snapshot.
+	IndexKey() string
 }
