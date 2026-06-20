@@ -27,8 +27,9 @@ Fusey achieves this by:
    thousands of files.
 3. Serving file reads as **HTTP range-GETs** against chunk objects — the
    filesystem is immediately usable while data streams in on demand.
-4. Running a background **compactor** that removes orphaned bytes from chunks
-   after files are overwritten or deleted.
+4. On-demand **compaction** (`fusey compact`) that removes orphaned bytes from
+   chunks after files are overwritten or deleted — designed to run as a
+   Kubernetes CronJob rather than a background goroutine inside the server.
 
 ## Architecture
 
@@ -50,10 +51,10 @@ Fusey achieves this by:
 │  │  xattrs             │     │  writes → append to active    │  │
 │  └──────────┬──────────┘     └───────────────────────────────┘  │
 │             │                                                   │
-│  ┌──────────▼──────────┐     ┌───────────────────────────────┐  │
-│  │  On-disk cache      │     │  Background compactor         │  │
-│  │  (FUSEY_CACHE_DIR)  │     │  (removes orphaned chunk data)│  │
-│  └─────────────────────┘     └───────────────────────────────┘  │
+│  ┌──────────▼──────────┐                                        │
+│  │  On-disk cache      │  fusey compact (run as a CronJob)      │
+│  │  (FUSEY_CACHE_DIR)  │  removes orphaned bytes from chunks    │
+│  └─────────────────────┘                                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -94,17 +95,46 @@ The index is stored:
 ### Compaction
 
 Over time, overwrites and deletes leave orphaned bytes in sealed chunks.
-The background compactor:
+`fusey compact` reclaims this space:
 
-1. Identifies sealed chunks above an orphan-fraction threshold.
+1. Identifies sealed chunks above the orphan-fraction threshold (`FUSEY_COMPACTION_THRESHOLD`).
 2. Reads all live extents from those chunks.
-3. Writes them into a new compacted chunk.
+3. Packs them into new compacted chunks, each no larger than `FUSEY_CHUNK_SIZE`.
 4. Updates the index to point at the new locations.
-5. Persists the index.
+5. Persists the index (to both local disk and S3).
 6. Deletes the old chunk objects.
 
 The index is always persisted **before** old chunks are deleted, so the
-process is crash-safe.
+process is crash-safe: a crash between steps 5 and 6 leaves duplicate data
+that is cleaned up on the next compaction run.
+
+Compaction is intentionally not run automatically inside the filesystem
+process — it generates a burst of S3 API calls and is best scheduled as a
+Kubernetes CronJob at a time and frequency that suits the workload:
+
+```yaml
+# Example: run compaction nightly at 02:00
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fusey-compact
+spec:
+  schedule: "0 2 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: compact
+            image: your-registry/fusey:latest
+            command: ["fusey", "compact"]
+            env:
+            - name: FUSEY_BUCKET
+              value: my-bucket
+            - name: FUSEY_PREFIX
+              value: pod-abc/
+          restartPolicy: OnFailure
+```
 
 ## Formal specification
 
@@ -167,8 +197,7 @@ as a Kubernetes container without config files.
 | `FUSEY_SECRET_KEY` | _(ambient creds)_ | S3 secret access key |
 | `FUSEY_FORCE_PATH_STYLE` | `false` | Set `true` for MinIO and most self-hosted S3-compatible stores that require path-style URLs |
 | `FUSEY_PREFIX` | _(none)_ | Key prefix for all objects in the bucket (e.g. `pod-abc/`). Use this to share one bucket across multiple Fusey instances |
-| `FUSEY_COMPACTION_THRESHOLD` | `0.3` | Orphan fraction above which a chunk is compacted |
-| `FUSEY_COMPACTION_INTERVAL` | `300s` | How often the compactor runs |
+| `FUSEY_COMPACTION_THRESHOLD` | `0.3` | Orphan fraction above which a chunk is targeted by `fusey compact` |
 | `FUSEY_PERSIST_INTERVAL` | `30s` | How often the index is flushed to disk and S3 |
 
 ## Project status
@@ -210,10 +239,30 @@ files with your normal macOS tools and build/run inside the VM.
 go build ./cmd/fusey
 ```
 
+### Run
+
+```bash
+# Mount a filesystem
+export FUSEY_BUCKET=my-bucket FUSEY_ENDPOINT=http://localhost:9000
+export FUSEY_ACCESS_KEY=... FUSEY_SECRET_KEY=... FUSEY_FORCE_PATH_STYLE=true
+./fusey mount /mnt/fusey
+
+# Run a compaction cycle (e.g. from a CronJob)
+./fusey compact
+```
+
 ### Test
 
 ```bash
+# Unit tests (no external dependencies)
 go test ./...
+
+# S3 integration tests (requires a running MinIO instance)
+docker run -d -p 9000:9000 -e MINIO_ROOT_USER=test -e MINIO_ROOT_PASSWORD=testtest \
+  minio/minio server /data
+FUSEY_TEST_ENDPOINT=http://localhost:9000 \
+FUSEY_ACCESS_KEY=test FUSEY_SECRET_KEY=testtest \
+go test ./internal/chunks/ -run TestS3
 ```
 
 ## Licence

@@ -71,8 +71,7 @@ internal/
    - `FUSEY_FORCE_PATH_STYLE` (default false) — required for MinIO / Ceph
    - `FUSEY_PREFIX` — key prefix for all S3 objects (e.g. `pod-abc/`),
      used to share one bucket across multiple Fusey instances
-   - `FUSEY_COMPACTION_THRESHOLD` (default 0.3) — orphan fraction trigger
-   - `FUSEY_COMPACTION_INTERVAL` (default 300s)
+   - `FUSEY_COMPACTION_THRESHOLD` (default 0.3) — orphan fraction trigger for `fusey compact`
    - `FUSEY_PERSIST_INTERVAL` (default 30s)
 
 9. **Invariants to preserve** (from specs, enforced in implementation):
