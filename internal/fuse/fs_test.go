@@ -17,9 +17,9 @@ import (
 	"github.com/tofarr/fusey/internal/index"
 )
 
-// mountFS mounts a fresh Fusey filesystem to a temp directory and returns
-// the mount path and a cleanup function.
-func mountFS(t *testing.T) (mnt string, cleanup func()) {
+// mountFSWithSize mounts a fresh Fusey filesystem with the given capacity.
+// Returns the mount path, index cache directory, and a cleanup function.
+func mountFSWithSize(t *testing.T, maxFSSize int64) (mnt, cacheDir string, cleanup func()) {
 	t.Helper()
 	local, err := chunks.NewLocalStore(t.TempDir())
 	if err != nil {
@@ -27,7 +27,8 @@ func mountFS(t *testing.T) (mnt string, cleanup func()) {
 	}
 	idx := index.New(4096)
 	cs := chunks.NewChunkStore(local, 64*1024*1024)
-	f := New(idx, cs, 10*1024*1024*1024) // 10 GiB for tests
+	cacheDir = t.TempDir()
+	f := New(idx, cs, maxFSSize, cacheDir)
 
 	mnt = t.TempDir()
 	server, err := gofs.Mount(mnt, f.Root(), &gofs.Options{
@@ -40,15 +41,18 @@ func mountFS(t *testing.T) (mnt string, cleanup func()) {
 	if err != nil {
 		t.Skipf("FUSE mount failed (no /dev/fuse?): %v", err)
 	}
-	return mnt, func() {
-		server.Unmount()
-	}
+	return mnt, cacheDir, func() { server.Unmount() }
+}
+
+// mountFS mounts a fresh Fusey filesystem with 10 GiB capacity.
+func mountFS(t *testing.T) (mnt, cacheDir string, cleanup func()) {
+	return mountFSWithSize(t, 10*1024*1024*1024)
 }
 
 // --- Tests ---
 
 func TestMountAndStatRoot(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	fi, err := os.Stat(mnt)
@@ -61,7 +65,7 @@ func TestMountAndStatRoot(t *testing.T) {
 }
 
 func TestCreateAndRead(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	path := filepath.Join(mnt, "hello.txt")
@@ -80,7 +84,7 @@ func TestCreateAndRead(t *testing.T) {
 }
 
 func TestStatFile(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	path := filepath.Join(mnt, "stat.txt")
@@ -100,7 +104,7 @@ func TestStatFile(t *testing.T) {
 }
 
 func TestWriteOverwrite(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	path := filepath.Join(mnt, "overwrite.txt")
@@ -117,7 +121,7 @@ func TestWriteOverwrite(t *testing.T) {
 }
 
 func TestMkdirAndReaddir(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	dir := filepath.Join(mnt, "subdir")
@@ -141,7 +145,7 @@ func TestMkdirAndReaddir(t *testing.T) {
 }
 
 func TestUnlink(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	path := filepath.Join(mnt, "todelete.txt")
@@ -156,7 +160,7 @@ func TestUnlink(t *testing.T) {
 }
 
 func TestRmdir(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	dir := filepath.Join(mnt, "emptydir")
@@ -170,7 +174,7 @@ func TestRmdir(t *testing.T) {
 }
 
 func TestRmdirNotEmpty(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	dir := filepath.Join(mnt, "nonempty")
@@ -184,7 +188,7 @@ func TestRmdirNotEmpty(t *testing.T) {
 }
 
 func TestRename(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	src := filepath.Join(mnt, "old.txt")
@@ -207,7 +211,7 @@ func TestRename(t *testing.T) {
 }
 
 func TestHardLink(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	src := filepath.Join(mnt, "original.txt")
@@ -230,7 +234,7 @@ func TestHardLink(t *testing.T) {
 }
 
 func TestSymlink(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	target := filepath.Join(mnt, "target.txt")
@@ -250,7 +254,7 @@ func TestSymlink(t *testing.T) {
 }
 
 func TestChmod(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	path := filepath.Join(mnt, "mode.txt")
@@ -265,7 +269,7 @@ func TestChmod(t *testing.T) {
 }
 
 func TestTruncate(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	path := filepath.Join(mnt, "trunc.txt")
@@ -280,7 +284,7 @@ func TestTruncate(t *testing.T) {
 }
 
 func TestLargeFile(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	path := filepath.Join(mnt, "large.bin")
@@ -299,7 +303,7 @@ func TestLargeFile(t *testing.T) {
 }
 
 func TestXattrs(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	path := filepath.Join(mnt, "xattr.txt")
@@ -319,7 +323,7 @@ func TestXattrs(t *testing.T) {
 }
 
 func TestStatfs(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	var st syscall.Statfs_t
@@ -345,7 +349,7 @@ func TestStatfs(t *testing.T) {
 }
 
 func TestTimestamps(t *testing.T) {
-	mnt, cleanup := mountFS(t)
+	mnt, _, cleanup := mountFS(t)
 	defer cleanup()
 
 	path := filepath.Join(mnt, "ts.txt")
@@ -361,4 +365,84 @@ func TestTimestamps(t *testing.T) {
 	if mtime.Before(before) || mtime.After(after) {
 		t.Errorf("mtime %v outside expected range [%v, %v]", mtime, before, after)
 	}
+}
+
+// TestEnospc verifies that writes which would grow a file past FUSEY_MAX_SIZE
+// return ENOSPC, while overwrites within the current extent always succeed.
+func TestEnospc(t *testing.T) {
+	const capacity = 100
+	mnt, _, cleanup := mountFSWithSize(t, capacity)
+	defer cleanup()
+
+	path := filepath.Join(mnt, "big.bin")
+
+	// Writing exactly at the capacity limit must succeed.
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0}, capacity), 0o644); err != nil {
+		t.Fatalf("write at capacity: %v", err)
+	}
+
+	// Overwriting within the same extent must succeed (no size growth).
+	if err := os.WriteFile(path, bytes.Repeat([]byte{1}, capacity), 0o644); err != nil {
+		t.Fatalf("overwrite within capacity: %v", err)
+	}
+
+	// Writing one byte beyond the current file end must fail with ENOSPC.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	_, err = f.Write([]byte{0xFF})
+	if err == nil {
+		t.Fatal("expected ENOSPC writing past capacity, got nil")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("no space")) {
+		t.Errorf("expected 'no space left' error, got: %v", err)
+	}
+}
+
+// TestFsync verifies that f.Sync() (fsync syscall) flushes the active chunk
+// to the store and persists the index snapshot to cacheDir.
+func TestFsync(t *testing.T) {
+	mnt, cacheDir, cleanup := mountFS(t)
+	defer cleanup()
+
+	path := filepath.Join(mnt, "synced.txt")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("durable")); err != nil {
+		t.Fatal(err)
+	}
+	// f.Sync() issues fsync(2) on the file descriptor.
+	if err := f.Sync(); err != nil {
+		t.Fatalf("fsync: %v", err)
+	}
+	f.Close()
+
+	// The index snapshot must have been written to cacheDir.
+	indexPath := filepath.Join(cacheDir, "index.json")
+	if _, err := os.Stat(indexPath); err != nil {
+		t.Errorf("index.json missing after fsync: %v", err)
+	}
+
+	// Data must still be readable after fsync.
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("durable")) {
+		t.Errorf("post-fsync read: got %q, want %q", got, "durable")
+	}
+
+	// A second fsync (idempotent) must not error.
+	f2, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f2.Sync(); err != nil {
+		t.Errorf("second fsync: %v", err)
+	}
+	f2.Close()
 }
