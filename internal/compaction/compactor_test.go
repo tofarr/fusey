@@ -10,6 +10,8 @@ import (
 	"github.com/tofarr/fusey/internal/index"
 )
 
+const testChunkSize = 64 // 64-byte chunks for fast rotation in tests
+
 // setup creates a minimal test environment: index, chunk store, and compactor.
 func setup(t *testing.T) (*index.Index, *chunks.ChunkStore, *Compactor) {
 	t.Helper()
@@ -18,15 +20,8 @@ func setup(t *testing.T) (*index.Index, *chunks.ChunkStore, *Compactor) {
 		t.Fatal(err)
 	}
 	idx := index.New(4096)
-	cs := chunks.NewChunkStore(local, 64) // 64-byte chunks for fast rotation in tests
-
-	persistCalled := false
-	persist := func() error {
-		persistCalled = true
-		_ = persistCalled
-		return nil
-	}
-	comp := New(idx, cs, persist, 0.3, time.Hour) // interval irrelevant for direct calls
+	cs := chunks.NewChunkStore(local, testChunkSize)
+	comp := New(idx, cs, func() error { return nil }, 0.3, testChunkSize)
 	return idx, cs, comp
 }
 
@@ -158,6 +153,82 @@ func TestCompactFullyOrphaned(t *testing.T) {
 	// is never written (no live bytes), so the net count decreases.
 	if len(sealed) >= before {
 		t.Errorf("sealed count: got %d, want < %d", len(sealed), before)
+	}
+}
+
+// TestCompactMultipleOutputChunks verifies that when live data in target chunks
+// exceeds chunkSize, the compactor produces multiple compacted output chunks
+// each within the size limit, and all file content is still readable.
+func TestCompactMultipleOutputChunks(t *testing.T) {
+	ctx := context.Background()
+	local, err := chunks.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := index.New(4096)
+
+	// Use a tiny chunk size (32 bytes) so the output must rotate.
+	const tiny = 32
+	cs := chunks.NewChunkStore(local, tiny)
+
+	var sealedBefore []string
+
+	// Write three files of 20 bytes each into separate chunks, each also
+	// containing 20 bytes of orphaned data (so orphanFrac = 0.5 >= 0.3).
+	files := []struct {
+		name    string
+		content []byte
+		ino     uint64
+	}{
+		{name: "a.txt", content: bytes.Repeat([]byte("A"), 20)},
+		{name: "b.txt", content: bytes.Repeat([]byte("B"), 20)},
+		{name: "c.txt", content: bytes.Repeat([]byte("C"), 20)},
+	}
+	for i := range files {
+		files[i].ino = writeFile(t, ctx, idx, cs, files[i].name, files[i].content)
+		// Add orphaned bytes to push orphanFrac to 0.5.
+		orphanIno := writeFile(t, ctx, idx, cs, "__orphan__", bytes.Repeat([]byte("X"), 20))
+		cs.Seal(ctx)
+		n := time.Now().UnixNano()
+		idx.RemoveDirEntry(index.RootIno, "__orphan__", n)
+		_ = orphanIno
+	}
+
+	sealedBefore, _ = cs.ListSealed(ctx)
+
+	comp := New(idx, cs, func() error { return nil }, 0.3, tiny)
+	if err := comp.Compact(ctx); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	sealedAfter, _ := cs.ListSealed(ctx)
+
+	// The three 40-byte chunks (each 50% orphaned) should have been targeted.
+	// Live data = 3 × 20 = 60 bytes; chunkSize = 32, so we expect at least
+	// two compacted output chunks (60 / 32 = 1.875 → 2 chunks minimum).
+	// Net: old chunks removed, new compacted chunks added.
+	if len(sealedAfter) >= len(sealedBefore) {
+		t.Errorf("sealed count: got %d, want < %d (targets should have been removed)", len(sealedAfter), len(sealedBefore))
+	}
+
+	// Every compacted chunk must be within the size limit.
+	for _, id := range sealedAfter {
+		sz, err := cs.SealedSize(ctx, id)
+		if err != nil {
+			t.Errorf("SealedSize(%s): %v", id, err)
+			continue
+		}
+		if sz > tiny {
+			t.Errorf("compacted chunk %s is %d bytes, exceeds chunkSize %d", id, sz, tiny)
+		}
+	}
+
+	// All live file content must still be readable and correct.
+	for _, f := range files {
+		got := readFile(t, ctx, idx, cs, f.ino)
+		if !bytes.Equal(got, f.content) {
+			t.Errorf("file %s after compaction: got %q, want %q", f.name, got, f.content)
+		}
 	}
 }
 

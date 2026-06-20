@@ -35,7 +35,6 @@ func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("FUSEY_BUCKET", "my-bucket")
 	t.Setenv("FUSEY_ENDPOINT", "https://s3.example.com")
 	t.Setenv("FUSEY_COMPACTION_THRESHOLD", "0.5")
-	t.Setenv("FUSEY_COMPACTION_INTERVAL", "10m")
 	t.Setenv("FUSEY_PERSIST_INTERVAL", "60s")
 
 	cfg, err := Load()
@@ -63,9 +62,6 @@ func TestLoadEnvOverrides(t *testing.T) {
 	if cfg.CompactionThreshold != 0.5 {
 		t.Errorf("CompactionThreshold: got %f", cfg.CompactionThreshold)
 	}
-	if cfg.CompactionInterval != 10*time.Minute {
-		t.Errorf("CompactionInterval: got %s", cfg.CompactionInterval)
-	}
 	if cfg.PersistInterval != 60*time.Second {
 		t.Errorf("PersistInterval: got %s", cfg.PersistInterval)
 	}
@@ -77,7 +73,6 @@ func TestLoadBadValues(t *testing.T) {
 		{"FUSEY_BLOCK_SIZE", "notanumber"},
 		{"FUSEY_MAX_SIZE", "notanumber"},
 		{"FUSEY_COMPACTION_THRESHOLD", "notafloat"},
-		{"FUSEY_COMPACTION_INTERVAL", "notaduration"},
 		{"FUSEY_PERSIST_INTERVAL", "notaduration"},
 	}
 	for _, c := range cases {

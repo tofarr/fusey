@@ -13,7 +13,6 @@ const (
 	DefaultMaxFSSize           int64         = 1024 * 1024 * 1024 * 1024 // 1 TiB
 	DefaultCacheDir                          = "/var/cache/fusey"
 	DefaultCompactionThreshold float64       = 0.3
-	DefaultCompactionInterval  time.Duration = 5 * time.Minute
 	DefaultPersistInterval     time.Duration = 30 * time.Second
 )
 
@@ -54,10 +53,8 @@ type Config struct {
 	// --- Background tasks ---
 
 	// CompactionThreshold is the orphan fraction above which a chunk is selected
-	// for compaction (FUSEY_COMPACTION_THRESHOLD).
+	// for compaction by `fusey compact` (FUSEY_COMPACTION_THRESHOLD).
 	CompactionThreshold float64
-	// CompactionInterval is how often the background compactor runs (FUSEY_COMPACTION_INTERVAL).
-	CompactionInterval time.Duration
 	// PersistInterval is how often the index is flushed to disk and S3 (FUSEY_PERSIST_INTERVAL).
 	PersistInterval time.Duration
 }
@@ -77,7 +74,6 @@ func Load() (*Config, error) {
 		SecretKey:           os.Getenv("FUSEY_SECRET_KEY"),
 		Prefix:              os.Getenv("FUSEY_PREFIX"),
 		CompactionThreshold: DefaultCompactionThreshold,
-		CompactionInterval:  DefaultCompactionInterval,
 		PersistInterval:     DefaultPersistInterval,
 	}
 	if v := os.Getenv("FUSEY_REGION"); v != "" {
@@ -103,9 +99,6 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if err := parseFloat64Env("FUSEY_COMPACTION_THRESHOLD", &cfg.CompactionThreshold); err != nil {
-		return nil, err
-	}
-	if err := parseDurationEnv("FUSEY_COMPACTION_INTERVAL", &cfg.CompactionInterval); err != nil {
 		return nil, err
 	}
 	if err := parseDurationEnv("FUSEY_PERSIST_INTERVAL", &cfg.PersistInterval); err != nil {
