@@ -16,10 +16,16 @@ import (
 //   - Exactly one chunk is Active at any time.
 //   - The active chunk never exceeds maxChunkSize bytes.
 //   - Sealed chunks are immutable.
+//
+// An optional local disk cache (set via SetCacheDir) stores sealed chunks on
+// the pod's local filesystem. Cache reads bypass the backing store entirely;
+// on a cache miss the full chunk is fetched once and written to disk so all
+// subsequent reads are served locally.
 type ChunkStore struct {
 	mu           sync.Mutex
 	store        Store
 	maxChunkSize int64
+	cache        *chunkCache // nil when local caching is disabled
 
 	activeID  string // ID of the current active chunk
 	activeBuf []byte // in-memory buffer for the active chunk
@@ -27,6 +33,7 @@ type ChunkStore struct {
 }
 
 // NewChunkStore creates a ChunkStore using store as the backing object store.
+// Local chunk caching is disabled by default; call SetCacheDir to enable it.
 func NewChunkStore(store Store, maxChunkSize int64) *ChunkStore {
 	cs := &ChunkStore{
 		store:        store,
@@ -36,6 +43,23 @@ func NewChunkStore(store Store, maxChunkSize int64) *ChunkStore {
 	cs.activeID = cs.chunkID(cs.nextSeq)
 	cs.nextSeq++
 	return cs
+}
+
+// SetCacheDir enables local disk caching of sealed chunks under baseDir/chunks/.
+// The directory is created if it does not exist. Once enabled, sealed chunk
+// reads are served from disk on a cache hit; on a miss the full chunk is
+// fetched from the backing store, written to disk, and the result returned.
+// When a chunk is sealed locally it is written to the cache immediately so
+// the very next read requires no store round-trip.
+func (cs *ChunkStore) SetCacheDir(baseDir string) error {
+	cache, err := newChunkCache(baseDir)
+	if err != nil {
+		return err
+	}
+	cs.mu.Lock()
+	cs.cache = cache
+	cs.mu.Unlock()
+	return nil
 }
 
 // chunkID formats a chunk ID from a sequence number.
@@ -98,6 +122,10 @@ func (cs *ChunkStore) Read(ctx context.Context, chunkID string, chunkOffset, len
 		}
 		return activeBuf[chunkOffset : chunkOffset+length], nil
 	}
+	// Sealed chunk: serve from local cache if enabled, otherwise fetch directly.
+	if cs.cache != nil {
+		return cs.cache.readRange(ctx, cs.store, chunkID, chunkOffset, length)
+	}
 	return cs.store.GetRange(ctx, chunkID, chunkOffset, length)
 }
 
@@ -119,9 +147,15 @@ func (cs *ChunkStore) sealLocked(ctx context.Context) error {
 	}
 	// Delete before put: FlushActive may have already written a partial
 	// version of this chunk; overwrite it with the full buffer.
-	_ = cs.store.Delete(ctx, cs.activeID)
-	if err := cs.store.Put(ctx, cs.activeID, cs.activeBuf); err != nil {
-		return fmt.Errorf("seal chunk %s: %w", cs.activeID, err)
+	sealID := cs.activeID
+	sealData := cs.activeBuf
+	_ = cs.store.Delete(ctx, sealID)
+	if err := cs.store.Put(ctx, sealID, sealData); err != nil {
+		return fmt.Errorf("seal chunk %s: %w", sealID, err)
+	}
+	// Write to local cache so the next read of this chunk is served from disk.
+	if cs.cache != nil {
+		_ = cs.cache.put(sealID, sealData) // best-effort: miss on failure falls back to store
 	}
 	cs.activeID = cs.chunkID(cs.nextSeq)
 	cs.nextSeq++
