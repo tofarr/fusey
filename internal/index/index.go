@@ -600,6 +600,25 @@ func (idx *Index) GetParentIno(ino uint64) uint64 {
 	return ino
 }
 
+// BlockSz returns the configured block size for this index instance.
+func (idx *Index) BlockSz() int32 {
+	return idx.blockSize
+}
+
+// UsedBytes returns the sum of the Size field across all regular-file inodes.
+// This is the value reported to the kernel as used space in statfs.
+func (idx *Index) UsedBytes() int64 {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	var total int64
+	for _, inode := range idx.inodes {
+		if inode.FileType == Regular {
+			total += inode.Size
+		}
+	}
+	return total
+}
+
 // LiveExtents returns the set of all extents currently referenced by any inode.
 // Used by the compactor to identify orphaned chunk data.
 func (idx *Index) LiveExtents() []Extent {

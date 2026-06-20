@@ -62,7 +62,7 @@ func main() {
 	cs := chunks.NewChunkStore(local, cfg.ChunkSize)
 
 	// Build and mount the FUSE filesystem.
-	f := fusefs.New(idx, cs)
+	f := fusefs.New(idx, cs, cfg.MaxFSSize)
 	server, err := gofs.Mount(mountpoint, f.Root(), &gofs.Options{
 		MountOptions: fuse.MountOptions{
 			FsName:     "fusey",

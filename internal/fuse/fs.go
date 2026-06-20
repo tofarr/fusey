@@ -22,13 +22,14 @@ const (
 
 // Fusey is the top-level filesystem object shared by all nodes and file handles.
 type Fusey struct {
-	idx *index.Index
-	cs  *chunks.ChunkStore
+	idx       *index.Index
+	cs        *chunks.ChunkStore
+	maxFSSize int64 // total capacity in bytes, reported via statfs
 }
 
-// New creates a Fusey filesystem.
-func New(idx *index.Index, cs *chunks.ChunkStore) *Fusey {
-	return &Fusey{idx: idx, cs: cs}
+// New creates a Fusey filesystem. maxFSSize is the value of FUSEY_MAX_SIZE.
+func New(idx *index.Index, cs *chunks.ChunkStore, maxFSSize int64) *Fusey {
+	return &Fusey{idx: idx, cs: cs, maxFSSize: maxFSSize}
 }
 
 // Root returns the root node for mounting.
@@ -46,22 +47,23 @@ type Node struct {
 	f   *Fusey
 }
 
-var _ fs.NodeGetattrer  = (*Node)(nil)
-var _ fs.NodeSetattrer  = (*Node)(nil)
-var _ fs.NodeLookuper   = (*Node)(nil)
-var _ fs.NodeReaddirer  = (*Node)(nil)
-var _ fs.NodeCreater    = (*Node)(nil)
-var _ fs.NodeMkdirer    = (*Node)(nil)
-var _ fs.NodeSymlinker  = (*Node)(nil)
-var _ fs.NodeReadlinker = (*Node)(nil)
-var _ fs.NodeLinker     = (*Node)(nil)
-var _ fs.NodeUnlinker   = (*Node)(nil)
-var _ fs.NodeRmdirer    = (*Node)(nil)
-var _ fs.NodeRenamer    = (*Node)(nil)
-var _ fs.NodeOpener     = (*Node)(nil)
-var _ fs.NodeGetxattrer = (*Node)(nil)
-var _ fs.NodeSetxattrer = (*Node)(nil)
-var _ fs.NodeListxattrer  = (*Node)(nil)
+var _ fs.NodeGetattrer     = (*Node)(nil)
+var _ fs.NodeSetattrer     = (*Node)(nil)
+var _ fs.NodeLookuper      = (*Node)(nil)
+var _ fs.NodeReaddirer     = (*Node)(nil)
+var _ fs.NodeCreater       = (*Node)(nil)
+var _ fs.NodeMkdirer       = (*Node)(nil)
+var _ fs.NodeSymlinker     = (*Node)(nil)
+var _ fs.NodeReadlinker    = (*Node)(nil)
+var _ fs.NodeLinker        = (*Node)(nil)
+var _ fs.NodeUnlinker      = (*Node)(nil)
+var _ fs.NodeRmdirer       = (*Node)(nil)
+var _ fs.NodeRenamer       = (*Node)(nil)
+var _ fs.NodeOpener        = (*Node)(nil)
+var _ fs.NodeStatfser      = (*Node)(nil)
+var _ fs.NodeGetxattrer    = (*Node)(nil)
+var _ fs.NodeSetxattrer    = (*Node)(nil)
+var _ fs.NodeListxattrer   = (*Node)(nil)
 var _ fs.NodeRemovexattrer = (*Node)(nil)
 
 func (n *Node) Getattr(ctx context.Context, fh fs.FileHandle, out *gofuse.AttrOut) syscall.Errno {
@@ -337,6 +339,26 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		return nil, 0, syscall.ENOENT
 	}
 	return &FileHandle{ino: n.ino, f: n.f}, 0, 0
+}
+
+func (n *Node) Statfs(ctx context.Context, out *gofuse.StatfsOut) syscall.Errno {
+	used := n.f.idx.UsedBytes()
+	total := n.f.maxFSSize
+	free := total - used
+	if free < 0 {
+		free = 0
+	}
+	bsize := uint64(n.f.idx.BlockSz())
+	out.Bsize = uint32(bsize)
+	out.Frsize = uint32(bsize)
+	out.Blocks = uint64(total) / bsize
+	out.Bfree = uint64(free) / bsize
+	out.Bavail = out.Bfree
+	// Report a generous inode count; we don't enforce a hard limit on inodes.
+	out.Files = uint64(total) / 4096
+	out.Ffree = out.Files
+	out.NameLen = 255
+	return 0
 }
 
 func (n *Node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {

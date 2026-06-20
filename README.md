@@ -158,6 +158,7 @@ as a Kubernetes container without config files.
 |---|---|---|
 | `FUSEY_CHUNK_SIZE` | `67108864` (64 MiB) | Maximum size of a single chunk object |
 | `FUSEY_BLOCK_SIZE` | `4096` | Preferred I/O block size reported to the kernel |
+| `FUSEY_MAX_SIZE` | `1099511627776` (1 TiB) | Total filesystem capacity in bytes reported to the kernel via `statfs`. `df` and tools that check free space use this value. Set it to match the expected maximum size of the data stored in this instance (e.g. `26843545600` for 25 GiB). |
 | `FUSEY_CACHE_DIR` | `/var/cache/fusey` | Directory for the on-disk index cache |
 | `FUSEY_BUCKET` | _(required)_ | Object store bucket name |
 | `FUSEY_ENDPOINT` | _(required)_ | Object store endpoint URL |
@@ -168,11 +169,11 @@ as a Kubernetes container without config files.
 ## Project status
 
 - [x] Formal specification (Quint)
-- [ ] Go implementation scaffold
-- [ ] FUSE layer (go-fuse)
-- [ ] Index persistence (disk cache)
-- [ ] Chunk store (S3 backend)
-- [ ] Background compactor
+- [x] Go implementation — index, chunk store, compaction, FUSE layer
+- [x] Index persistence (disk cache — `FUSEY_CACHE_DIR/index.json`)
+- [x] `statfs` support (`FUSEY_MAX_SIZE`)
+- [ ] S3 chunk store backend (interface defined; `LocalStore` used for now)
+- [ ] Index persistence to object store (for cold-start on a new node)
 - [ ] Kubernetes deployment guide
 
 ## Development

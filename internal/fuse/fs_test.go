@@ -27,7 +27,7 @@ func mountFS(t *testing.T) (mnt string, cleanup func()) {
 	}
 	idx := index.New(4096)
 	cs := chunks.NewChunkStore(local, 64*1024*1024)
-	f := New(idx, cs)
+	f := New(idx, cs, 10*1024*1024*1024) // 10 GiB for tests
 
 	mnt = t.TempDir()
 	server, err := gofs.Mount(mnt, f.Root(), &gofs.Options{
@@ -315,6 +315,32 @@ func TestXattrs(t *testing.T) {
 	}
 	if string(buf[:n]) != "bar" {
 		t.Errorf("getxattr: got %q, want %q", buf[:n], "bar")
+	}
+}
+
+func TestStatfs(t *testing.T) {
+	mnt, cleanup := mountFS(t)
+	defer cleanup()
+
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(mnt, &st); err != nil {
+		t.Fatal(err)
+	}
+	// Total blocks must be > 0 (derived from FUSEY_MAX_SIZE / block_size).
+	if st.Blocks == 0 {
+		t.Error("Statfs Blocks should be > 0")
+	}
+	// Free must not exceed total.
+	if st.Bfree > st.Blocks {
+		t.Errorf("Statfs Bfree (%d) > Blocks (%d)", st.Bfree, st.Blocks)
+	}
+	// Write a file and verify free space decreases.
+	blocksBefore := st.Bfree
+	os.WriteFile(filepath.Join(mnt, "space.bin"), bytes.Repeat([]byte{0}, 4096*10), 0o644)
+	var st2 syscall.Statfs_t
+	syscall.Statfs(mnt, &st2)
+	if st2.Bfree >= blocksBefore {
+		t.Errorf("Bfree did not decrease after write: before=%d after=%d", blocksBefore, st2.Bfree)
 	}
 }
 

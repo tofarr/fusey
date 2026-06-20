@@ -49,6 +49,10 @@ module filesystem {
   const ROOT_INO     : int
   const BLOCK_SIZE   : int
   const MAX_CHUNK_SIZE: int
+  // Maximum total size of the filesystem in bytes (FUSEY_MAX_SIZE env var).
+  // Reported to the kernel via statfs as total blocks.
+  // Must be > 0.
+  const MAX_FS_SIZE  : int
 
   // -------------------------------------------------------------------------
   // Pure helpers (duplicated from sub-modules for self-containedness)
@@ -526,6 +530,28 @@ module filesystem {
   }
 
   // -------------------------------------------------------------------------
+  // FUSE: statfs — report filesystem space usage to the kernel.
+  //
+  // Returns total, free, and available block counts derived from MAX_FS_SIZE
+  // and the current sum of all allocated inode blocks.
+  //
+  // Maps to: fuse.Operations.Statfs
+  // -------------------------------------------------------------------------
+
+  // usedBytes computes the total bytes allocated across all regular-file inodes.
+  pure def usedBytes(ins: int -> Inode): int =
+    ins.values()
+       .filter(n => n.fileType == Regular)
+       .map(n => n.size)
+       .fold(0, (acc, s) => acc + s)
+
+  action statfs = {
+    // No state changes; kernel reads the returned values directly.
+    // Implementation fills fuse.StatfsOut from MAX_FS_SIZE and usedBytes.
+    require(MAX_FS_SIZE > 0)
+  }
+
+  // -------------------------------------------------------------------------
   // Global filesystem invariants
   // -------------------------------------------------------------------------
 
@@ -577,6 +603,10 @@ module filesystem {
   // blksize matches configuration in every inode.
   invariant blksizeConsistency =
     forall ino in inodes.keys(): inodes.get(ino).blksize == BLOCK_SIZE
+
+  // Total used bytes never exceed the configured maximum.
+  invariant usedWithinBound =
+    usedBytes(inodes) <= MAX_FS_SIZE
 
   // -------------------------------------------------------------------------
   // Temporal properties

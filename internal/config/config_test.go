@@ -16,6 +16,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.BlockSize != DefaultBlockSize {
 		t.Errorf("BlockSize: got %d, want %d", cfg.BlockSize, DefaultBlockSize)
 	}
+	if cfg.MaxFSSize != DefaultMaxFSSize {
+		t.Errorf("MaxFSSize: got %d, want %d", cfg.MaxFSSize, DefaultMaxFSSize)
+	}
 	if cfg.CacheDir != DefaultCacheDir {
 		t.Errorf("CacheDir: got %q, want %q", cfg.CacheDir, DefaultCacheDir)
 	}
@@ -27,6 +30,7 @@ func TestLoadDefaults(t *testing.T) {
 func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("FUSEY_CHUNK_SIZE", "1048576")
 	t.Setenv("FUSEY_BLOCK_SIZE", "8192")
+	t.Setenv("FUSEY_MAX_SIZE", "26843545600") // 25 GiB
 	t.Setenv("FUSEY_CACHE_DIR", "/tmp/fusey-test")
 	t.Setenv("FUSEY_BUCKET", "my-bucket")
 	t.Setenv("FUSEY_ENDPOINT", "https://s3.example.com")
@@ -43,6 +47,9 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 	if cfg.BlockSize != 8192 {
 		t.Errorf("BlockSize: got %d, want 8192", cfg.BlockSize)
+	}
+	if cfg.MaxFSSize != 26843545600 {
+		t.Errorf("MaxFSSize: got %d, want 26843545600", cfg.MaxFSSize)
 	}
 	if cfg.CacheDir != "/tmp/fusey-test" {
 		t.Errorf("CacheDir: got %q", cfg.CacheDir)
@@ -68,6 +75,7 @@ func TestLoadBadValues(t *testing.T) {
 	cases := []struct{ key, val string }{
 		{"FUSEY_CHUNK_SIZE", "notanumber"},
 		{"FUSEY_BLOCK_SIZE", "notanumber"},
+		{"FUSEY_MAX_SIZE", "notanumber"},
 		{"FUSEY_COMPACTION_THRESHOLD", "notafloat"},
 		{"FUSEY_COMPACTION_INTERVAL", "notaduration"},
 		{"FUSEY_PERSIST_INTERVAL", "notaduration"},
@@ -80,5 +88,13 @@ func TestLoadBadValues(t *testing.T) {
 				t.Errorf("expected error for %s=%s", c.key, c.val)
 			}
 		})
+	}
+}
+
+func TestMaxFSSizeZeroIsInvalid(t *testing.T) {
+	t.Setenv("FUSEY_MAX_SIZE", "0")
+	_, err := Load()
+	if err == nil {
+		t.Error("expected error for FUSEY_MAX_SIZE=0")
 	}
 }
