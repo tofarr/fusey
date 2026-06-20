@@ -133,23 +133,33 @@ func mustLoadConfig() *config.Config {
 // mustBuildStore constructs the appropriate ObjectStore based on config.
 // When FUSEY_BROKER_URL is set, a BrokerStore is used; otherwise an S3Store.
 func mustBuildStore(ctx context.Context, cfg *config.Config) (chunks.ObjectStore, *chunks.ChunkStore) {
+	var (
+		objStore chunks.ObjectStore
+		cs       *chunks.ChunkStore
+	)
 	if cfg.BrokerURL != "" {
 		log.Printf("using broker store: %s", cfg.BrokerURL)
 		bs := chunks.NewBrokerStore(cfg.BrokerURL, cfg.BrokerAuthHeader, cfg.BrokerAuthValue)
-		return bs, chunks.NewChunkStore(bs, cfg.ChunkSize)
+		objStore = bs
+	} else {
+		log.Printf("using S3 store: bucket=%s endpoint=%s", cfg.Bucket, cfg.Endpoint)
+		s3store, err := chunks.NewS3Store(
+			ctx,
+			cfg.Bucket, cfg.Endpoint, cfg.Region,
+			cfg.AccessKey, cfg.SecretKey,
+			cfg.Prefix,
+			cfg.ForcePathStyle,
+		)
+		if err != nil {
+			log.Fatalf("S3 store: %v", err)
+		}
+		objStore = s3store
 	}
-	log.Printf("using S3 store: bucket=%s endpoint=%s", cfg.Bucket, cfg.Endpoint)
-	s3store, err := chunks.NewS3Store(
-		ctx,
-		cfg.Bucket, cfg.Endpoint, cfg.Region,
-		cfg.AccessKey, cfg.SecretKey,
-		cfg.Prefix,
-		cfg.ForcePathStyle,
-	)
-	if err != nil {
-		log.Fatalf("S3 store: %v", err)
+	cs = chunks.NewChunkStore(objStore, cfg.ChunkSize)
+	if err := cs.SetCacheDir(cfg.CacheDir); err != nil {
+		log.Fatalf("chunk cache: %v", err)
 	}
-	return s3store, chunks.NewChunkStore(s3store, cfg.ChunkSize)
+	return objStore, cs
 }
 
 // buildPersistFn returns a function that writes the index to local disk then
