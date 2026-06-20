@@ -9,11 +9,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -38,28 +38,28 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-
-	// Load or initialise the index.
-	idx, err := index.Load(cfg.CacheDir, cfg.BlockSize)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Fatalf("load index: %v", err)
-		}
-		log.Printf("no existing index in %s; starting fresh", cfg.CacheDir)
-		idx = index.New(cfg.BlockSize)
+	if cfg.Bucket == "" {
+		log.Fatal("FUSEY_BUCKET is required")
 	}
 
-	// Initialise the chunk store.
-	if cfg.Bucket == "" || cfg.Endpoint == "" {
-		log.Fatal("FUSEY_BUCKET and FUSEY_ENDPOINT are required")
-	}
-	// TODO: replace LocalStore with an S3Store once implemented.
-	chunkDir := filepath.Join(cfg.CacheDir, "chunks")
-	local, err := chunks.NewLocalStore(chunkDir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Build the S3 store (used for both chunks and index persistence).
+	s3store, err := chunks.NewS3Store(
+		ctx,
+		cfg.Bucket, cfg.Endpoint, cfg.Region,
+		cfg.AccessKey, cfg.SecretKey,
+		cfg.Prefix,
+		cfg.ForcePathStyle,
+	)
 	if err != nil {
-		log.Fatalf("chunk store: %v", err)
+		log.Fatalf("S3 store: %v", err)
 	}
-	cs := chunks.NewChunkStore(local, cfg.ChunkSize)
+	cs := chunks.NewChunkStore(s3store, cfg.ChunkSize)
+
+	// Load index — three-step: local disk → S3 → fresh.
+	idx := loadIndex(ctx, cfg, s3store)
 
 	// Build and mount the FUSE filesystem.
 	f := fusefs.New(idx, cs, cfg.MaxFSSize, cfg.CacheDir)
@@ -74,10 +74,19 @@ func main() {
 	}
 	log.Printf("fusey mounted at %s", mountpoint)
 
-	// Periodic index persistence.
+	// persistFn writes the index to local disk then to S3.
 	persistFn := func() error {
-		return index.Save(idx, cfg.CacheDir)
+		if err := index.Save(idx, cfg.CacheDir); err != nil {
+			return err
+		}
+		data, err := index.Marshal(idx)
+		if err != nil {
+			return err
+		}
+		return s3store.PutRaw(ctx, s3store.IndexKey(), data)
 	}
+
+	// Periodic persist goroutine.
 	go func() {
 		ticker := time.NewTicker(cfg.PersistInterval)
 		defer ticker.Stop()
@@ -92,7 +101,6 @@ func main() {
 
 	// Background compaction.
 	comp := compaction.New(idx, cs, persistFn, cfg.CompactionThreshold, cfg.CompactionInterval)
-	ctx, cancel := context.WithCancel(context.Background())
 	go comp.Run(ctx)
 
 	// Wait for SIGINT/SIGTERM.
@@ -105,9 +113,46 @@ func main() {
 	if err := server.Unmount(); err != nil {
 		log.Printf("unmount: %v", err)
 	}
-	// Final persist before exit.
 	if err := persistFn(); err != nil {
 		log.Printf("final persist: %v", err)
 	}
 	log.Println("done")
+}
+
+// loadIndex tries to restore the index from (in order):
+//  1. Local disk cache — fastest, used on warm restarts.
+//  2. S3 — used when the local cache is absent (new pod, warm pod takeover).
+//  3. Empty index — genuinely fresh filesystem (first ever mount).
+func loadIndex(ctx context.Context, cfg *config.Config, s3store *chunks.S3Store) *index.Index {
+	// 1. Local disk cache.
+	idx, err := index.Load(cfg.CacheDir, cfg.BlockSize)
+	if err == nil {
+		log.Printf("loaded index from local cache %s", cfg.CacheDir)
+		return idx
+	}
+	if !os.IsNotExist(err) {
+		log.Fatalf("load index from disk: %v", err)
+	}
+
+	// 2. S3.
+	data, err := s3store.GetRaw(ctx, s3store.IndexKey())
+	if err == nil {
+		idx, err = index.Unmarshal(data, cfg.BlockSize)
+		if err != nil {
+			log.Fatalf("parse index from S3: %v", err)
+		}
+		log.Printf("loaded index from S3 (%s/%s)", cfg.Bucket, s3store.IndexKey())
+		// Warm local cache for the next restart.
+		if saveErr := index.Save(idx, cfg.CacheDir); saveErr != nil {
+			log.Printf("warn: could not cache index locally: %v", saveErr)
+		}
+		return idx
+	}
+	if !errors.Is(err, chunks.ErrNotFound) {
+		log.Fatalf("load index from S3: %v", err)
+	}
+
+	// 3. Fresh filesystem.
+	log.Printf("no existing index found; starting fresh filesystem")
+	return index.New(cfg.BlockSize)
 }

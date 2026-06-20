@@ -46,3 +46,22 @@ func Load(dir string, blockSize int32) (*Index, error) {
 	}
 	return FromSnapshot(&snap, blockSize), nil
 }
+
+// Marshal serialises the index to JSON bytes. Used for S3 persistence where
+// a file path is not available.
+func Marshal(idx *Index) ([]byte, error) {
+	data, err := json.Marshal(idx.Snapshot())
+	if err != nil {
+		return nil, fmt.Errorf("marshal snapshot: %w", err)
+	}
+	return data, nil
+}
+
+// Unmarshal restores an Index from the JSON bytes produced by Marshal.
+func Unmarshal(data []byte, blockSize int32) (*Index, error) {
+	var snap Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, fmt.Errorf("unmarshal snapshot: %w", err)
+	}
+	return FromSnapshot(&snap, blockSize), nil
+}

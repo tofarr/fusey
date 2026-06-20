@@ -158,22 +158,27 @@ as a Kubernetes container without config files.
 |---|---|---|
 | `FUSEY_CHUNK_SIZE` | `67108864` (64 MiB) | Maximum size of a single chunk object |
 | `FUSEY_BLOCK_SIZE` | `4096` | Preferred I/O block size reported to the kernel |
-| `FUSEY_MAX_SIZE` | `1099511627776` (1 TiB) | Total filesystem capacity in bytes reported to the kernel via `statfs`. `df` and tools that check free space use this value. Set it to match the expected maximum size of the data stored in this instance (e.g. `26843545600` for 25 GiB). |
-| `FUSEY_CACHE_DIR` | `/var/cache/fusey` | Directory for the on-disk index cache |
-| `FUSEY_BUCKET` | _(required)_ | Object store bucket name |
-| `FUSEY_ENDPOINT` | _(required)_ | Object store endpoint URL |
+| `FUSEY_MAX_SIZE` | `1099511627776` (1 TiB) | Total filesystem capacity in bytes reported to the kernel via `statfs`. Set to the expected maximum data size per instance (e.g. `26843545600` for 25 GiB). |
+| `FUSEY_CACHE_DIR` | `/var/cache/fusey` | Directory for the on-disk index cache (fast path on restart) |
+| `FUSEY_BUCKET` | _(required)_ | S3 bucket name |
+| `FUSEY_ENDPOINT` | _(AWS default)_ | S3-compatible endpoint URL (e.g. `http://minio:9000` for MinIO) |
+| `FUSEY_REGION` | `us-east-1` | S3 region |
+| `FUSEY_ACCESS_KEY` | _(ambient creds)_ | S3 access key ID. Omit to use the ambient credential chain (IAM role, `AWS_*` env vars, `~/.aws`) |
+| `FUSEY_SECRET_KEY` | _(ambient creds)_ | S3 secret access key |
+| `FUSEY_FORCE_PATH_STYLE` | `false` | Set `true` for MinIO and most self-hosted S3-compatible stores that require path-style URLs |
+| `FUSEY_PREFIX` | _(none)_ | Key prefix for all objects in the bucket (e.g. `pod-abc/`). Use this to share one bucket across multiple Fusey instances |
 | `FUSEY_COMPACTION_THRESHOLD` | `0.3` | Orphan fraction above which a chunk is compacted |
 | `FUSEY_COMPACTION_INTERVAL` | `300s` | How often the compactor runs |
-| `FUSEY_PERSIST_INTERVAL` | `30s` | How often the index is flushed to disk cache |
+| `FUSEY_PERSIST_INTERVAL` | `30s` | How often the index is flushed to disk and S3 |
 
 ## Project status
 
 - [x] Formal specification (Quint)
 - [x] Go implementation — index, chunk store, compaction, FUSE layer
-- [x] Index persistence (disk cache — `FUSEY_CACHE_DIR/index.json`)
+- [x] Index persistence (local disk cache + S3)
 - [x] `statfs` support (`FUSEY_MAX_SIZE`)
-- [ ] S3 chunk store backend (interface defined; `LocalStore` used for now)
-- [ ] Index persistence to object store (for cold-start on a new node)
+- [x] S3 chunk store backend (`aws-sdk-go-v2`, S3-compatible)
+- [x] Cold-start recovery (local cache → S3 → fresh)
 - [ ] Kubernetes deployment guide
 
 ## Development

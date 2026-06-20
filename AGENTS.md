@@ -61,11 +61,16 @@ internal/
    - `FUSEY_CHUNK_SIZE` (default 64 MiB) — max chunk object size
    - `FUSEY_BLOCK_SIZE` (default 4096) — blksize reported to kernel
    - `FUSEY_MAX_SIZE` (default 1 TiB) — total filesystem capacity in bytes,
-     reported to the kernel via `statfs`. Free space = MaxFSSize − usedBytes.
-     Must be > 0. Set to expected max data size per instance (e.g. 25 GiB).
+     reported to the kernel via `statfs`. Must be > 0.
    - `FUSEY_CACHE_DIR` (default `/var/cache/fusey`) — on-disk index cache
    - `FUSEY_BUCKET` — S3 bucket name (required)
-   - `FUSEY_ENDPOINT` — S3 endpoint URL (required)
+   - `FUSEY_ENDPOINT` — S3-compatible endpoint URL (e.g. MinIO)
+   - `FUSEY_REGION` (default `us-east-1`) — S3 region
+   - `FUSEY_ACCESS_KEY` / `FUSEY_SECRET_KEY` — static S3 credentials
+     (omit to use ambient credential chain: IAM role, AWS_* env vars, ~/.aws)
+   - `FUSEY_FORCE_PATH_STYLE` (default false) — required for MinIO / Ceph
+   - `FUSEY_PREFIX` — key prefix for all S3 objects (e.g. `pod-abc/`),
+     used to share one bucket across multiple Fusey instances
    - `FUSEY_COMPACTION_THRESHOLD` (default 0.3) — orphan fraction trigger
    - `FUSEY_COMPACTION_INTERVAL` (default 300s)
    - `FUSEY_PERSIST_INTERVAL` (default 30s)
