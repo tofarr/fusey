@@ -28,16 +28,37 @@ type Config struct {
 	MaxFSSize int64
 	// CacheDir is the directory used for the on-disk index cache (FUSEY_CACHE_DIR).
 	CacheDir string
-	// Bucket is the object store bucket name (FUSEY_BUCKET).
+
+	// --- S3 / object store ---
+
+	// Bucket is the S3 bucket name (FUSEY_BUCKET). Required.
 	Bucket string
-	// Endpoint is the object store endpoint URL (FUSEY_ENDPOINT).
+	// Endpoint is the S3-compatible endpoint URL (FUSEY_ENDPOINT).
+	// Leave empty to use the default AWS regional endpoint.
 	Endpoint string
+	// Region is the S3 region (FUSEY_REGION, default "us-east-1").
+	Region string
+	// AccessKey is the S3 access key ID (FUSEY_ACCESS_KEY).
+	// Leave empty to use the ambient credential chain (IAM role, env vars, etc.).
+	AccessKey string
+	// SecretKey is the S3 secret access key (FUSEY_SECRET_KEY).
+	SecretKey string
+	// ForcePathStyle forces path-style S3 URLs (FUSEY_FORCE_PATH_STYLE).
+	// Required for MinIO and most self-hosted S3-compatible stores.
+	ForcePathStyle bool
+	// Prefix is prepended to every object key in the bucket (FUSEY_PREFIX).
+	// Use this when multiple Fusey instances share a single bucket; e.g. "pod-abc/".
+	// Chunks are stored as {Prefix}chunk-XXXXXXXX; the index as {Prefix}index.json.
+	Prefix string
+
+	// --- Background tasks ---
+
 	// CompactionThreshold is the orphan fraction above which a chunk is selected
 	// for compaction (FUSEY_COMPACTION_THRESHOLD).
 	CompactionThreshold float64
 	// CompactionInterval is how often the background compactor runs (FUSEY_COMPACTION_INTERVAL).
 	CompactionInterval time.Duration
-	// PersistInterval is how often the index is flushed to the disk cache (FUSEY_PERSIST_INTERVAL).
+	// PersistInterval is how often the index is flushed to disk and S3 (FUSEY_PERSIST_INTERVAL).
 	PersistInterval time.Duration
 }
 
@@ -51,9 +72,16 @@ func Load() (*Config, error) {
 		CacheDir:            DefaultCacheDir,
 		Bucket:              os.Getenv("FUSEY_BUCKET"),
 		Endpoint:            os.Getenv("FUSEY_ENDPOINT"),
+		Region:              "us-east-1",
+		AccessKey:           os.Getenv("FUSEY_ACCESS_KEY"),
+		SecretKey:           os.Getenv("FUSEY_SECRET_KEY"),
+		Prefix:              os.Getenv("FUSEY_PREFIX"),
 		CompactionThreshold: DefaultCompactionThreshold,
 		CompactionInterval:  DefaultCompactionInterval,
 		PersistInterval:     DefaultPersistInterval,
+	}
+	if v := os.Getenv("FUSEY_REGION"); v != "" {
+		cfg.Region = v
 	}
 
 	if err := parseInt64Env("FUSEY_CHUNK_SIZE", &cfg.ChunkSize); err != nil {
@@ -70,6 +98,9 @@ func Load() (*Config, error) {
 	}
 	if v := os.Getenv("FUSEY_CACHE_DIR"); v != "" {
 		cfg.CacheDir = v
+	}
+	if err := parseBoolEnv("FUSEY_FORCE_PATH_STYLE", &cfg.ForcePathStyle); err != nil {
+		return nil, err
 	}
 	if err := parseFloat64Env("FUSEY_COMPACTION_THRESHOLD", &cfg.CompactionThreshold); err != nil {
 		return nil, err
@@ -119,6 +150,19 @@ func parseFloat64Env(key string, dst *float64) error {
 		return fmt.Errorf("%s: %w", key, err)
 	}
 	*dst = f
+	return nil
+}
+
+func parseBoolEnv(key string, dst *bool) error {
+	v := os.Getenv(key)
+	if v == "" {
+		return nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	*dst = b
 	return nil
 }
 
