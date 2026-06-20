@@ -181,7 +181,22 @@ as a Kubernetes container without config files.
 
 - Go 1.22+
 - [Quint](https://quint-lang.org/) (for spec verification)
-- A FUSE-capable Linux host or macOS with macFUSE
+- A FUSE-capable Linux host
+
+### macOS
+
+Fusey uses Linux FUSE and is not tested against macFUSE or FUSE-T.
+For local development and testing on macOS, use [Lima](https://lima-vm.io/)
+to run a lightweight Linux VM:
+
+```bash
+brew install lima
+limactl start                 # starts a default Ubuntu VM
+limactl shell default         # open a shell inside the VM
+```
+
+Lima mounts your home directory into the VM by default, so you can edit
+files with your normal macOS tools and build/run inside the VM.
 
 ### Build
 
