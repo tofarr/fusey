@@ -4,6 +4,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"syscall"
 	"time"
@@ -175,19 +176,18 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	*fs.Inode, fs.FileHandle, uint32, syscall.Errno,
 ) {
 	now := time.Now().UnixNano()
-	// Only keep permission bits from mode.
 	perm := mode & 0o7777
 	caller, ok := gofuse.FromContext(ctx)
 	uid, gid := uint32(0), uint32(0)
 	if ok {
 		uid, gid = caller.Uid, caller.Gid
 	}
-	ino, err := n.f.idx.CreateInode(index.Regular, perm, uid, gid, 0, now)
+	ino, err := n.f.idx.MakeFile(n.ino, name, perm, uid, gid, 0, now)
 	if err != nil {
+		if errors.Is(err, index.ErrExist) {
+			return nil, nil, 0, syscall.EEXIST
+		}
 		return nil, nil, 0, syscall.EIO
-	}
-	if err := n.f.idx.AddDirEntry(n.ino, name, ino, now); err != nil {
-		return nil, nil, 0, syscall.EEXIST
 	}
 	inode, _ := n.f.idx.GetInode(ino)
 	fillAttr(&inode, &out.Attr)
@@ -210,12 +210,12 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *gofuse.
 	if ok {
 		uid, gid = caller.Uid, caller.Gid
 	}
-	ino, err := n.f.idx.CreateInode(index.Directory, perm, uid, gid, 0, now)
+	ino, err := n.f.idx.MakeDir(n.ino, name, perm, uid, gid, now)
 	if err != nil {
+		if errors.Is(err, index.ErrExist) {
+			return nil, syscall.EEXIST
+		}
 		return nil, syscall.EIO
-	}
-	if err := n.f.idx.AddDirEntry(n.ino, name, ino, now); err != nil {
-		return nil, syscall.EEXIST
 	}
 	inode, _ := n.f.idx.GetInode(ino)
 	fillAttr(&inode, &out.Attr)
@@ -236,14 +236,11 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *gofuse.Ent
 	if ok {
 		uid, gid = caller.Uid, caller.Gid
 	}
-	ino, err := n.f.idx.CreateInode(index.Symlink, 0o777, uid, gid, 0, now)
+	ino, err := n.f.idx.MakeSymlink(n.ino, name, target, uid, gid, now)
 	if err != nil {
-		return nil, syscall.EIO
-	}
-	if err := n.f.idx.AddDirEntry(n.ino, name, ino, now); err != nil {
-		return nil, syscall.EEXIST
-	}
-	if err := n.f.idx.SetSymlink(ino, target, now); err != nil {
+		if errors.Is(err, index.ErrExist) {
+			return nil, syscall.EEXIST
+		}
 		return nil, syscall.EIO
 	}
 	inode, _ := n.f.idx.GetInode(ino)
