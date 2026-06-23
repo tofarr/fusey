@@ -54,7 +54,7 @@ func runMount(mountpoint string) {
 	objStore, cs := mustBuildStore(ctx, cfg)
 	idx := loadIndex(ctx, cfg, objStore)
 
-	persistFn := buildPersistFn(ctx, cfg, idx, objStore)
+	persistFn := buildPersistFn(ctx, cfg, idx, cs, objStore)
 
 	f := fusefs.New(idx, cs, cfg.MaxFSSize, cfg.CacheDir)
 	server, err := gofs.Mount(mountpoint, f.Root(), &gofs.Options{
@@ -108,7 +108,7 @@ func runCompact() {
 	objStore, cs := mustBuildStore(ctx, cfg)
 	idx := loadIndex(ctx, cfg, objStore)
 
-	persistFn := buildPersistFn(ctx, cfg, idx, objStore)
+	persistFn := buildPersistFn(ctx, cfg, idx, cs, objStore)
 	comp := compaction.New(idx, cs, persistFn, cfg.CompactionThreshold, cfg.ChunkSize)
 
 	log.Println("starting compaction cycle")
@@ -166,10 +166,18 @@ func mustBuildStore(ctx context.Context, cfg *config.Config) (chunks.ObjectStore
 	return objStore, cs
 }
 
-// buildPersistFn returns a function that writes the index to local disk then
-// to the object store (S3 or broker).
-func buildPersistFn(ctx context.Context, cfg *config.Config, idx *index.Index, store chunks.ObjectStore) func() error {
+// buildPersistFn returns a function that atomically flushes the active chunk
+// and then writes the index to local disk and the object store.
+//
+// FlushActive is called first so the remote store is always self-consistent:
+// every extent the persisted index references exists as an object in the store.
+// This bounds the data-loss window to at most one FUSEY_PERSIST_INTERVAL on
+// any crash, including OOM kills where no signal handler runs.
+func buildPersistFn(ctx context.Context, cfg *config.Config, idx *index.Index, cs *chunks.ChunkStore, store chunks.ObjectStore) func() error {
 	return func() error {
+		if err := cs.FlushActive(ctx); err != nil {
+			return err
+		}
 		if err := index.Save(idx, cfg.CacheDir); err != nil {
 			return err
 		}
