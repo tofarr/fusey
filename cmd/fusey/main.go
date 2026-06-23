@@ -59,8 +59,9 @@ func runMount(mountpoint string) {
 	f := fusefs.New(idx, cs, cfg.MaxFSSize, cfg.CacheDir)
 	server, err := gofs.Mount(mountpoint, f.Root(), &gofs.Options{
 		MountOptions: fuse.MountOptions{
-			FsName:     "fusey",
-			AllowOther: false,
+			FsName:      "fusey",
+			AllowOther:  false,
+			DirectMount: true, // use mount(2) directly; requires CAP_SYS_ADMIN but avoids fusermount dependency
 		},
 	})
 	if err != nil {
