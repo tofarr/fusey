@@ -1,0 +1,32 @@
+version: 2
+
+project_name: fusey
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: fusey
+    main: ./cmd/fusey
+    binary: fusey
+    # FUSE is a Linux kernel feature; darwin/windows builds are not meaningful.
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
