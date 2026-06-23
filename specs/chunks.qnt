@@ -17,6 +17,14 @@
 // offsets because those are what the index cares about.  Actual I/O
 // correctness (that the right bytes are stored and retrieved) is an
 // implementation concern outside the scope of this state-machine spec.
+//
+// Storage semantics assumed by this spec:
+//   Store.Put — create-or-replace (idempotent overwrite).  The active chunk
+//     may be flushed to the store (via FlushActive) before it is sealed, and
+//     then overwritten by sealLocked with the complete buffer.  Both writes
+//     carry the same chunk ID; the second atomically replaces the first.
+//     This spec does not model intermediate flush states; the invariants below
+//     hold over the logical sealed-chunk state only.
 
 module chunks {
 

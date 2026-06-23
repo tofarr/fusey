@@ -31,9 +31,8 @@ func (s *LocalStore) Put(_ context.Context, id string, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.path(id)
-	if _, err := os.Stat(p); err == nil {
-		return fmt.Errorf("chunk %q already exists", id)
-	}
+	// Write to a temp file then atomically rename so reads never see a partial write.
+	// os.Rename replaces any existing file, giving create-or-replace semantics.
 	tmp := p + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return fmt.Errorf("write chunk %q: %w", id, err)

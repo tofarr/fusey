@@ -182,11 +182,10 @@ func (cs *ChunkStore) sealLocked(ctx context.Context) error {
 		cs.nextSeq++
 		return nil
 	}
-	// Delete before put: FlushActive may have already written a partial
-	// version of this chunk; overwrite it with the full buffer.
+	// Store.Put has create-or-replace semantics, so a partial FlushActive write
+	// is safely overwritten here with the full sealed buffer.
 	sealID := cs.activeID
 	sealData := cs.activeBuf
-	_ = cs.store.Delete(ctx, sealID)
 	if err := cs.store.Put(ctx, sealID, sealData); err != nil {
 		return fmt.Errorf("seal chunk %s: %w", sealID, err)
 	}
@@ -209,9 +208,7 @@ func (cs *ChunkStore) FlushActive(ctx context.Context) error {
 	if !cs.activeDirty {
 		return nil
 	}
-	// Write the active buffer to the store without rotating (chunk stays active).
-	// We overwrite any partial flush that may already exist in the store.
-	_ = cs.store.Delete(ctx, cs.activeID) // ignore not-found
+	// Store.Put has create-or-replace semantics so no prior delete is needed.
 	if err := cs.store.Put(ctx, cs.activeID, cs.activeBuf); err != nil {
 		return err
 	}

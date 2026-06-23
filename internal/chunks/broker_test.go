@@ -13,13 +13,20 @@ import (
 	"testing"
 )
 
-// fakeBrokerServer is a minimal in-memory implementation of the broker HTTP API,
-// used as the server-side fixture in all BrokerStore tests.
+// fakeBrokerServer is a minimal in-memory implementation of the broker HTTP
+// API, used as the server-side fixture in all BrokerStore tests.
+//
+// It implements the two-phase presigned-URL protocol:
+//   - Auth-protected broker endpoints issue self-referential "presigned" URLs
+//     (pointing to /raw/{id} on this same server) that do not require the auth
+//     header, mimicking how real S3 presigned URLs embed credentials in the URL.
+//   - /raw/{id} endpoints serve as the simulated object store.
 type fakeBrokerServer struct {
 	mu         sync.Mutex
 	objects    map[string][]byte
 	authHeader string
 	authValue  string
+	serverURL  string // set after httptest.NewServer starts
 }
 
 func newFakeBrokerServer(authHeader, authValue string) *fakeBrokerServer {
@@ -31,34 +38,103 @@ func newFakeBrokerServer(authHeader, authValue string) *fakeBrokerServer {
 }
 
 func (b *fakeBrokerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// /raw/{id} — unauthenticated object store (simulates S3 presigned URL target)
+	if strings.HasPrefix(r.URL.Path, "/raw/") {
+		b.serveRaw(w, r)
+		return
+	}
+
+	// All other routes require auth.
 	if r.Header.Get(b.authHeader) != b.authValue {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// Route: /objects or /objects/{id}
-	path := strings.TrimPrefix(r.URL.Path, "/objects")
-	if path == "" || path == "/" {
-		// List
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		b.mu.Lock()
-		ids := make([]string, 0, len(b.objects))
-		for id := range b.objects {
-			ids = append(ids, id)
-		}
-		b.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(ids)
+	switch {
+	case r.URL.Path == "/objects":
+		b.serveList(w, r)
+	case strings.HasSuffix(r.URL.Path, "/upload-url"):
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/objects/"), "/upload-url")
+		b.serveUploadURL(w, r, id)
+	case strings.HasSuffix(r.URL.Path, "/download-url"):
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/objects/"), "/download-url")
+		b.serveDownloadURL(w, r, id)
+	default:
+		id := strings.TrimPrefix(r.URL.Path, "/objects/")
+		b.serveObjectDirect(w, r, id)
+	}
+}
+
+// serveList handles GET /objects → JSON array of IDs.
+func (b *fakeBrokerServer) serveList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	b.mu.Lock()
+	ids := make([]string, 0, len(b.objects))
+	for id := range b.objects {
+		ids = append(ids, id)
+	}
+	b.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ids)
+}
 
-	id := strings.TrimPrefix(path, "/")
+// serveUploadURL handles GET /objects/{id}/upload-url → presigned PUT URL.
+func (b *fakeBrokerServer) serveUploadURL(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(presignedURLResponse{URL: b.serverURL + "/raw/" + id})
+}
+
+// serveDownloadURL handles GET /objects/{id}/download-url → presigned GET URL.
+func (b *fakeBrokerServer) serveDownloadURL(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	b.mu.Lock()
+	_, exists := b.objects[id]
+	b.mu.Unlock()
+	if !exists {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(presignedURLResponse{URL: b.serverURL + "/raw/" + id})
+}
+
+// serveObjectDirect handles DELETE and HEAD /objects/{id} (no byte transfer).
+func (b *fakeBrokerServer) serveObjectDirect(w http.ResponseWriter, r *http.Request, id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	switch r.Method {
+	case http.MethodDelete:
+		delete(b.objects, id)
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodHead:
+		data, ok := b.objects[id]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
 
+// serveRaw handles PUT and GET /raw/{id} — the simulated S3 presigned URL target.
+// No auth check: credentials are assumed to be embedded in the URL (as with real S3).
+func (b *fakeBrokerServer) serveRaw(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/raw/")
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	switch r.Method {
 	case http.MethodPut:
 		data, err := io.ReadAll(r.Body)
@@ -68,7 +144,6 @@ func (b *fakeBrokerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		b.objects[id] = data
 		w.WriteHeader(http.StatusCreated)
-
 	case http.MethodGet:
 		data, ok := b.objects[id]
 		if !ok {
@@ -83,8 +158,7 @@ func (b *fakeBrokerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Parse "bytes=start-end"
-		rangeHdr = strings.TrimPrefix(rangeHdr, "bytes=")
-		parts := strings.SplitN(rangeHdr, "-", 2)
+		parts := strings.SplitN(strings.TrimPrefix(rangeHdr, "bytes="), "-", 2)
 		if len(parts) != 2 {
 			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
 			return
@@ -99,31 +173,18 @@ func (b *fakeBrokerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(slice)))
 		w.WriteHeader(http.StatusPartialContent)
 		w.Write(slice)
-
-	case http.MethodDelete:
-		delete(b.objects, id)
-		w.WriteHeader(http.StatusNoContent)
-
-	case http.MethodHead:
-		data, ok := b.objects[id]
-		if !ok {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-		w.WriteHeader(http.StatusOK)
-
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// newBrokerTestSetup spins up a fakeBrokerServer HTTP server and returns a BrokerStore
-// wired to it. The server is closed when the test finishes.
+// newBrokerTestSetup spins up a fakeBrokerServer HTTP test server and returns
+// a BrokerStore wired to it. The server is closed when the test finishes.
 func newBrokerTestSetup(t *testing.T) (*BrokerStore, *fakeBrokerServer) {
 	t.Helper()
 	broker := newFakeBrokerServer("X-Session-Api-Key", "test-secret")
 	srv := httptest.NewServer(broker)
+	broker.serverURL = srv.URL // set after start so presigned URLs resolve correctly
 	t.Cleanup(srv.Close)
 	store := NewBrokerStore(srv.URL, "X-Session-Api-Key", "test-secret")
 	return store, broker

@@ -14,18 +14,26 @@ import (
 
 const brokerIndexKey = "index.json"
 
-// BrokerStore implements ObjectStore by delegating all object operations to a
-// trusted broker service over HTTP. The broker holds object-store credentials;
-// this process authenticates with a single bearer token and never contacts the
-// underlying object store directly.
+// BrokerStore implements ObjectStore using a two-phase presigned-URL protocol.
+// The broker holds object-store credentials; fusey authenticates with a single
+// bearer token and uploads/downloads bytes directly to/from the object store,
+// keeping the broker out of the data path.
 //
-// API contract (all requests carry the configured auth header):
+// Broker API (all requests carry the configured auth header):
 //
-//	PUT    /objects/{id}   — create or overwrite an object
-//	GET    /objects/{id}   — retrieve bytes; honours the Range header
-//	DELETE /objects/{id}   — remove an object (idempotent)
-//	HEAD   /objects/{id}   — return Content-Length only
-//	GET    /objects        — return a JSON array of object IDs
+//	GET    /objects/{id}/upload-url   — return a presigned PUT URL for the object
+//	GET    /objects/{id}/download-url — return a presigned GET URL for the object
+//	DELETE /objects/{id}              — remove an object (idempotent)
+//	HEAD   /objects/{id}              — return Content-Length only
+//	GET    /objects                   — return a JSON array of object IDs
+//
+// Data flow for writes:
+//  1. GET /objects/{id}/upload-url   → {"url":"https://s3…"}  (auth header required)
+//  2. PUT bytes directly to the presigned URL              (no auth header; creds in URL)
+//
+// Data flow for reads:
+//  1. GET /objects/{id}/download-url → {"url":"https://s3…"}  (auth header required)
+//  2. GET the presigned URL with a Range header            (no auth header; creds in URL)
 //
 // The filesystem index is stored under the reserved ID "index.json". List()
 // excludes this ID so it is never treated as a chunk by the compactor.
@@ -36,9 +44,15 @@ type BrokerStore struct {
 	client     *http.Client
 }
 
+// presignedURLResponse is the JSON body returned by the upload-url and
+// download-url broker endpoints.
+type presignedURLResponse struct {
+	URL string `json:"url"`
+}
+
 // NewBrokerStore constructs a BrokerStore.
 // baseURL is the scheme+host+optional-path prefix of the broker (no trailing slash).
-// authHeader and authValue are the header name and token sent on every request.
+// authHeader and authValue are the header name and token sent on every broker request.
 func NewBrokerStore(baseURL, authHeader, authValue string) *BrokerStore {
 	return &BrokerStore{
 		baseURL:    strings.TrimRight(baseURL, "/"),
@@ -48,12 +62,12 @@ func NewBrokerStore(baseURL, authHeader, authValue string) *BrokerStore {
 	}
 }
 
-// objectURL builds the URL for a specific object ID.
+// objectURL builds the broker URL for a specific object ID.
 func (s *BrokerStore) objectURL(id string) string {
 	return s.baseURL + "/objects/" + id
 }
 
-// newRequest builds an authenticated HTTP request.
+// newRequest builds an authenticated request to the broker.
 func (s *BrokerStore) newRequest(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
@@ -63,8 +77,8 @@ func (s *BrokerStore) newRequest(ctx context.Context, method, url string, body i
 	return req, nil
 }
 
-// checkStatus maps broker HTTP status codes to Go errors.
-func checkStatus(resp *http.Response, id string, op string) error {
+// checkBrokerStatus maps broker HTTP status codes to Go errors.
+func checkBrokerStatus(resp *http.Response, id string, op string) error {
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusCreated, http.StatusNoContent, http.StatusPartialContent:
 		return nil
@@ -78,43 +92,111 @@ func checkStatus(resp *http.Response, id string, op string) error {
 	}
 }
 
-// Put writes data as a new object with the given id.
+// checkStorageStatus maps object-store (S3/GCS) HTTP status codes to Go errors.
+// Used for responses to requests made directly to presigned URLs.
+func checkStorageStatus(resp *http.Response, id string, op string) error {
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusNoContent, http.StatusPartialContent:
+		return nil
+	case http.StatusNotFound:
+		return ErrNotFound
+	case http.StatusForbidden:
+		// Presigned URL has expired or is invalid.
+		return fmt.Errorf("storage %s %q: forbidden (presigned URL expired or invalid)", op, id)
+	default:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return fmt.Errorf("storage %s %q: status %d: %s", op, id, resp.StatusCode, body)
+	}
+}
+
+// uploadURL asks the broker for a presigned PUT URL for the given object id.
+func (s *BrokerStore) uploadURL(ctx context.Context, id string) (string, error) {
+	req, err := s.newRequest(ctx, http.MethodGet, s.objectURL(id)+"/upload-url", nil)
+	if err != nil {
+		return "", fmt.Errorf("broker upload-url %q: %w", id, err)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("broker upload-url %q: %w", id, err)
+	}
+	defer resp.Body.Close()
+	if err := checkBrokerStatus(resp, id, "upload-url"); err != nil {
+		return "", err
+	}
+	var p presignedURLResponse
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return "", fmt.Errorf("broker upload-url %q: decode: %w", id, err)
+	}
+	return p.URL, nil
+}
+
+// downloadURL asks the broker for a presigned GET URL for the given object id.
+func (s *BrokerStore) downloadURL(ctx context.Context, id string) (string, error) {
+	req, err := s.newRequest(ctx, http.MethodGet, s.objectURL(id)+"/download-url", nil)
+	if err != nil {
+		return "", fmt.Errorf("broker download-url %q: %w", id, err)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("broker download-url %q: %w", id, err)
+	}
+	defer resp.Body.Close()
+	if err := checkBrokerStatus(resp, id, "download-url"); err != nil {
+		return "", err
+	}
+	var p presignedURLResponse
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return "", fmt.Errorf("broker download-url %q: decode: %w", id, err)
+	}
+	return p.URL, nil
+}
+
+// Put obtains a presigned PUT URL from the broker and uploads data directly
+// to the object store, bypassing the broker for the data transfer.
 func (s *BrokerStore) Put(ctx context.Context, id string, data []byte) error {
-	req, err := s.newRequest(ctx, http.MethodPut, s.objectURL(id), bytes.NewReader(data))
+	url, err := s.uploadURL(ctx, id)
+	if err != nil {
+		return fmt.Errorf("broker put %q: %w", id, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("broker put %q: %w", id, err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.ContentLength = int64(len(data))
-
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("broker put %q: %w", id, err)
 	}
 	defer resp.Body.Close()
-	return checkStatus(resp, id, "put")
+	return checkStorageStatus(resp, id, "put")
 }
 
-// GetRange reads length bytes starting at offset from the object with id.
+// GetRange obtains a presigned GET URL from the broker and downloads length
+// bytes starting at offset directly from the object store.
 func (s *BrokerStore) GetRange(ctx context.Context, id string, offset, length int64) ([]byte, error) {
-	req, err := s.newRequest(ctx, http.MethodGet, s.objectURL(id), nil)
+	url, err := s.downloadURL(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("broker get %q: %w", id, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("broker get %q: %w", id, err)
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("broker get %q: %w", id, err)
 	}
 	defer resp.Body.Close()
-	if err := checkStatus(resp, id, "get"); err != nil {
+	if err := checkStorageStatus(resp, id, "get"); err != nil {
 		return nil, err
 	}
 	return io.ReadAll(resp.Body)
 }
 
-// Delete removes the object with the given id. Missing objects are not an error.
+// Delete removes the object with the given id via the broker.
+// Missing objects are not an error.
 func (s *BrokerStore) Delete(ctx context.Context, id string) error {
 	req, err := s.newRequest(ctx, http.MethodDelete, s.objectURL(id), nil)
 	if err != nil {
@@ -125,14 +207,15 @@ func (s *BrokerStore) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("broker delete %q: %w", id, err)
 	}
 	defer resp.Body.Close()
-	if err := checkStatus(resp, id, "delete"); err != nil && !errors.Is(err, ErrNotFound) {
+	if err := checkBrokerStatus(resp, id, "delete"); err != nil && !errors.Is(err, ErrNotFound) {
 		return err
 	}
 	return nil
 }
 
-// List returns the IDs of all chunk objects. The index key ("index.json") is
-// excluded so it is never mistaken for a chunk by the compactor.
+// List returns the IDs of all chunk objects via the broker.
+// The index key ("index.json") is excluded so it is never treated as a chunk
+// by the compactor.
 func (s *BrokerStore) List(ctx context.Context) ([]string, error) {
 	req, err := s.newRequest(ctx, http.MethodGet, s.baseURL+"/objects", nil)
 	if err != nil {
@@ -143,7 +226,7 @@ func (s *BrokerStore) List(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("broker list: %w", err)
 	}
 	defer resp.Body.Close()
-	if err := checkStatus(resp, "", "list"); err != nil {
+	if err := checkBrokerStatus(resp, "", "list"); err != nil {
 		return nil, err
 	}
 	var ids []string
@@ -160,7 +243,7 @@ func (s *BrokerStore) List(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-// Size returns the byte count of the object with id.
+// Size returns the byte count of the object with id via a broker HEAD request.
 func (s *BrokerStore) Size(ctx context.Context, id string) (int64, error) {
 	req, err := s.newRequest(ctx, http.MethodHead, s.objectURL(id), nil)
 	if err != nil {
@@ -171,7 +254,7 @@ func (s *BrokerStore) Size(ctx context.Context, id string) (int64, error) {
 		return 0, fmt.Errorf("broker size %q: %w", id, err)
 	}
 	defer resp.Body.Close()
-	if err := checkStatus(resp, id, "size"); err != nil {
+	if err := checkBrokerStatus(resp, id, "size"); err != nil {
 		return 0, err
 	}
 	if resp.ContentLength < 0 {
@@ -180,15 +263,20 @@ func (s *BrokerStore) Size(ctx context.Context, id string) (int64, error) {
 	return resp.ContentLength, nil
 }
 
-// PutRaw writes raw bytes to an arbitrary key. Used for index persistence.
+// PutRaw writes raw bytes to an arbitrary key via the presigned upload path.
+// Used for index persistence.
 func (s *BrokerStore) PutRaw(ctx context.Context, key string, data []byte) error {
 	return s.Put(ctx, key, data)
 }
 
-// GetRaw reads the full content of an arbitrary key. Used for index recovery.
-// Returns ErrNotFound if the key does not exist.
+// GetRaw reads the full content of an arbitrary key via the presigned download
+// path. Used for index recovery. Returns ErrNotFound if the key does not exist.
 func (s *BrokerStore) GetRaw(ctx context.Context, key string) ([]byte, error) {
-	req, err := s.newRequest(ctx, http.MethodGet, s.objectURL(key), nil)
+	url, err := s.downloadURL(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("broker get raw %q: %w", key, err)
 	}
@@ -197,7 +285,7 @@ func (s *BrokerStore) GetRaw(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("broker get raw %q: %w", key, err)
 	}
 	defer resp.Body.Close()
-	if err := checkStatus(resp, key, "get raw"); err != nil {
+	if err := checkStorageStatus(resp, key, "get raw"); err != nil {
 		return nil, err
 	}
 	return io.ReadAll(resp.Body)

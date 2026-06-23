@@ -11,8 +11,10 @@ import "context"
 // store (for production), and a BrokerStore (for multi-tenant deployments).
 // All methods must be safe for concurrent use.
 type Store interface {
-	// Put writes data as a new immutable object with the given id.
-	// It is an error to call Put with an id that already exists.
+	// Put writes data to the object with the given id, creating it if it
+	// does not exist or replacing it if it does. Callers must not rely on
+	// read-modify-write atomicity; concurrent Puts for the same id have
+	// last-write-wins semantics.
 	Put(ctx context.Context, id string, data []byte) error
 
 	// GetRange reads length bytes starting at offset from the object with id.

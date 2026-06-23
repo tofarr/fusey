@@ -296,10 +296,10 @@ func TestFlushActiveDirtyTracking(t *testing.T) {
 	}
 }
 
-// TestSealAfterFlushActive reproduces the bug where sealLocked would fail
-// because FlushActive had already PUT the same chunk ID to the store.
-// After the fix (delete-before-put in sealLocked) the full buffer must be
-// readable from the sealed chunk.
+// TestSealAfterFlushActive verifies that sealing a chunk after a partial
+// FlushActive write produces the correct full buffer in the store.
+// Store.Put has create-or-replace semantics, so sealLocked simply overwrites
+// the partial flush with the complete buffer without a prior delete.
 func TestSealAfterFlushActive(t *testing.T) {
 	ctx := context.Background()
 	_, cs := newTestStore(t)
