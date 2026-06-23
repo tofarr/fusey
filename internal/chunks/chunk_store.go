@@ -27,9 +27,10 @@ type ChunkStore struct {
 	maxChunkSize int64
 	cache        *chunkCache // nil when local caching is disabled
 
-	activeID  string // ID of the current active chunk
-	activeBuf []byte // in-memory buffer for the active chunk
-	nextSeq   int    // monotone counter used to generate chunk IDs
+	activeID    string // ID of the current active chunk
+	activeBuf   []byte // in-memory buffer for the active chunk
+	activeDirty bool   // true if activeBuf has data not yet written to the store
+	nextSeq     int    // monotone counter used to generate chunk IDs
 }
 
 // NewChunkStore creates a ChunkStore using store as the backing object store.
@@ -129,6 +130,7 @@ func (cs *ChunkStore) Append(ctx context.Context, data []byte, fileOffset int64)
 
 	chunkOffset := int64(len(cs.activeBuf))
 	cs.activeBuf = append(cs.activeBuf, data...)
+	cs.activeDirty = true
 
 	return index.Extent{
 		ChunkID:     cs.activeID,
@@ -195,22 +197,26 @@ func (cs *ChunkStore) sealLocked(ctx context.Context) error {
 	cs.activeID = cs.chunkID(cs.nextSeq)
 	cs.nextSeq++
 	cs.activeBuf = cs.activeBuf[:0]
+	cs.activeDirty = false
 	return nil
 }
 
-// FlushActive ensures any unflushed active-chunk data is written to the store.
-// Safe to call multiple times; a no-op if the active buffer is empty.
+// FlushActive writes the active chunk to the store if it has been modified
+// since the last flush. It is a no-op when the buffer is empty or clean.
 func (cs *ChunkStore) FlushActive(ctx context.Context) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	if len(cs.activeBuf) == 0 {
+	if !cs.activeDirty {
 		return nil
 	}
-	// Write active buffer to store but keep it as the active chunk (don't rotate).
-	// This is used at persist time so reads via the store path work too.
-	// We overwrite if it already exists (the store may have a previous partial flush).
+	// Write the active buffer to the store without rotating (chunk stays active).
+	// We overwrite any partial flush that may already exist in the store.
 	_ = cs.store.Delete(ctx, cs.activeID) // ignore not-found
-	return cs.store.Put(ctx, cs.activeID, cs.activeBuf)
+	if err := cs.store.Put(ctx, cs.activeID, cs.activeBuf); err != nil {
+		return err
+	}
+	cs.activeDirty = false
+	return nil
 }
 
 // DeleteChunks removes the given chunk IDs from the backing store.

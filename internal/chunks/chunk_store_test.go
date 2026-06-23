@@ -204,6 +204,98 @@ func TestTooBigForChunk(t *testing.T) {
 	}
 }
 
+// countingStore wraps a Store and records how many Put calls were made.
+type countingStore struct {
+	Store
+	puts int
+}
+
+func (s *countingStore) Put(ctx context.Context, id string, data []byte) error {
+	s.puts++
+	return s.Store.Put(ctx, id, data)
+}
+
+// TestFlushActiveDirtyTracking verifies that FlushActive only issues a PUT
+// when the active buffer has been modified since the last flush.
+func TestFlushActiveDirtyTracking(t *testing.T) {
+	ctx := context.Background()
+	local, err := NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := NewChunkStore(local, 1024)
+	cs.store = &countingStore{Store: local} // swap in counting store
+	counting := cs.store.(*countingStore)
+
+	// Fresh store: activeDirty is false, FlushActive must be a no-op.
+	if cs.activeDirty {
+		t.Error("activeDirty: want false before any append")
+	}
+	if err := cs.FlushActive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if counting.puts != 0 {
+		t.Errorf("FlushActive on clean buffer: want 0 PUTs, got %d", counting.puts)
+	}
+
+	// Append makes the buffer dirty.
+	if _, err := cs.Append(ctx, []byte("hello"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if !cs.activeDirty {
+		t.Error("activeDirty: want true after append")
+	}
+
+	// First FlushActive: should PUT and clear the dirty flag.
+	if err := cs.FlushActive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cs.activeDirty {
+		t.Error("activeDirty: want false after FlushActive")
+	}
+	putsAfterFirst := counting.puts
+
+	// Second FlushActive with no new appends: must be a no-op.
+	if err := cs.FlushActive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if counting.puts != putsAfterFirst {
+		t.Errorf("second FlushActive without append: want %d PUTs (no change), got %d",
+			putsAfterFirst, counting.puts)
+	}
+
+	// Another append makes it dirty again.
+	if _, err := cs.Append(ctx, []byte(" world"), 5); err != nil {
+		t.Fatal(err)
+	}
+	if !cs.activeDirty {
+		t.Error("activeDirty: want true after second append")
+	}
+	putsBeforeThird := counting.puts
+
+	// Third FlushActive: should PUT again.
+	if err := cs.FlushActive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if counting.puts == putsBeforeThird {
+		t.Error("third FlushActive after append: want a new PUT, got none")
+	}
+	if cs.activeDirty {
+		t.Error("activeDirty: want false after third FlushActive")
+	}
+
+	// Seal clears the dirty flag too.
+	if _, err := cs.Append(ctx, []byte("!"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.Seal(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cs.activeDirty {
+		t.Error("activeDirty: want false after Seal")
+	}
+}
+
 // TestSealAfterFlushActive reproduces the bug where sealLocked would fail
 // because FlushActive had already PUT the same chunk ID to the store.
 // After the fix (delete-before-put in sealLocked) the full buffer must be
