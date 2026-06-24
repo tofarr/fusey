@@ -74,7 +74,7 @@ func runMount(mountpoint string) {
 		ticker := time.NewTicker(cfg.PersistInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			if idx.IsDirty() {
+			if idx.IsDirty() || idx.IsRemoteDirty() {
 				if err := persistFn(); err != nil {
 					log.Printf("persist index: %v", err)
 				}
@@ -170,29 +170,43 @@ func mustBuildStore(ctx context.Context, cfg *config.Config) (chunks.ObjectStore
 // to the remote object store.
 //
 // Ordering rationale:
-//  1. index.Save (local disk) — always runs first. The broker's availability
-//     must not gate the local durability guarantee; the pod must be able to
-//     recover from its local cache even if the remote write fails.
+//  1. index.Save (local disk) — runs when the in-memory index has diverged
+//     from disk. The broker's availability must not gate local durability;
+//     the pod can recover from its local cache even if the remote write fails.
 //  2. cs.FlushActive (remote chunk) — runs before the remote index write so
 //     the remote store is always self-consistent: every extent the persisted
-//     index references exists as a chunk object in the store. If this fails,
-//     the function returns the error (which the caller logs) but the local
-//     cache is already up to date.
-//  3. store.PutRaw (remote index) — written last, only if the chunk flush
-//     succeeded, preserving remote-store consistency.
+//     index references exists as a chunk object in the store. FlushActive is a
+//     no-op when the active buffer has not been modified since the last flush.
+//  3. store.PutRaw (remote index) — written last, and only when the index has
+//     structural mutations since the last remote write (idx.IsRemoteDirty()).
+//     Atime-only updates from reads do not set the remote-dirty flag, so pure
+//     read workloads generate no presigned-URL round-trips.
 func buildPersistFn(ctx context.Context, cfg *config.Config, idx *index.Index, cs *chunks.ChunkStore, store chunks.ObjectStore) func() error {
 	return func() error {
-		if err := index.Save(idx, cfg.CacheDir); err != nil {
-			return err
+		// Step 1: persist index to local cache when it has diverged.
+		if idx.IsDirty() {
+			if err := index.Save(idx, cfg.CacheDir); err != nil {
+				return err
+			}
 		}
+		// Step 2: flush the active chunk (no-op when unmodified since last flush).
 		if err := cs.FlushActive(ctx); err != nil {
 			return err
+		}
+		// Step 3: upload the index to the remote store only when structural
+		// mutations have occurred since the last remote write.
+		if !idx.IsRemoteDirty() {
+			return nil
 		}
 		data, err := index.Marshal(idx)
 		if err != nil {
 			return err
 		}
-		return store.PutRaw(ctx, store.IndexKey(), data)
+		if err := store.PutRaw(ctx, store.IndexKey(), data); err != nil {
+			return err
+		}
+		idx.MarkRemoteClean()
+		return nil
 	}
 }
 

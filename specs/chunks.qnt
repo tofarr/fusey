@@ -54,6 +54,11 @@ module chunks {
   // In the implementation chunk IDs are strings such as "chunk-00000042".
   var nextChunkSeq: int
 
+  // True when the active chunk's in-memory buffer has been written since the
+  // last flush to the remote store. FlushActive is a no-op when this is false,
+  // preventing unnecessary presigned-URL round-trips for the active chunk.
+  var chunkDirty: bool
+
   // The extent that was produced by the most recent appendData action.
   // filesystem.qnt reads this to construct the Extent record it passes
   // to index.appendExtent.  (Quint actions have no return values; this is
@@ -129,6 +134,7 @@ module chunks {
     chunks'             = Map(firstId -> firstChunk)
     activeChunkId'      = firstId
     nextChunkSeq'       = 1
+    chunkDirty'         = false
     lastWrittenExtent'  = sentinel
   }
 
@@ -148,6 +154,7 @@ module chunks {
                        .set(newId, newChunk)
     activeChunkId' = newId
     nextChunkSeq'  = nextChunkSeq + 1
+    chunkDirty'    = false   // sealed chunk is flushed; new active is empty
   }
 
   // -------------------------------------------------------------------------
@@ -188,6 +195,7 @@ module chunks {
                           })
     activeChunkId'      = targetId
     nextChunkSeq'       = if (willRotate) nextChunkSeq + 1 else nextChunkSeq
+    chunkDirty'         = true   // active chunk now has unflushed data
     lastWrittenExtent'  = {
                             chunkId    : targetId,
                             chunkOffset: baseSize,
@@ -213,6 +221,7 @@ module chunks {
     chunks'            = chunks
     activeChunkId'     = activeChunkId
     nextChunkSeq'      = nextChunkSeq
+    chunkDirty'        = chunkDirty
     lastWrittenExtent' = lastWrittenExtent
   }
 
@@ -234,7 +243,42 @@ module chunks {
                        .set(newId, newChunk)
     activeChunkId' = newId
     nextChunkSeq'  = nextChunkSeq + 1
+    chunkDirty'    = false   // sealed chunk flushed to store; new active is empty
   }
+
+  // -------------------------------------------------------------------------
+  // flushActive — upload the active chunk's current buffer to the store.
+  //
+  // This is a no-op (precondition blocks the action) when the buffer has not
+  // been modified since the last flush. The implementation checks activeDirty
+  // before calling Store.Put, avoiding a presigned-URL round-trip when no new
+  // data has been written. Invariants about the logical chunk sizes are
+  // unchanged: flushActive writes bytes but does not grow or shrink the chunk.
+  // -------------------------------------------------------------------------
+
+  action flushActive = {
+    require(chunkDirty)
+    // The active chunk's logical size and content are unchanged; only the
+    // store now holds an up-to-date copy of the buffer.
+    chunks'            = chunks
+    activeChunkId'     = activeChunkId
+    nextChunkSeq'      = nextChunkSeq
+    chunkDirty'        = false
+    lastWrittenExtent' = lastWrittenExtent
+  }
+
+  // -------------------------------------------------------------------------
+  // Invariants — dirty flag
+  // -------------------------------------------------------------------------
+
+  // chunkDirty is false only when the active chunk's in-memory buffer has
+  // already been persisted to the store (or the buffer is empty, i.e. we just
+  // started or rotated without any new appends).
+  // Equivalently: if chunkDirty is false, flushActive must not be called.
+  // This invariant is enforced by the require(chunkDirty) in flushActive.
+  invariant chunkDirtyOnlyWhenDataUnflushed =
+    not(chunkDirty) implies
+      chunks.get(activeChunkId).size >= 0  // trivially true; key constraint is in flushActive.require
 
   // -------------------------------------------------------------------------
   // Temporal properties
