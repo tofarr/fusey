@@ -61,7 +61,19 @@ internal/
    then flushes to S3 (or local cache) before returning to the kernel. The
    index is updated in memory immediately and persisted asynchronously.
 
-8. **Environment variables** (all prefixed `FUSEY_`):
+8. **Mount ready-signal protocol** (see `specs/mount.qnt`):
+   The orchestrator (runtime-api) launches `fusey mount` as a background process
+   and must not proceed to `/api/init` until the FUSE filesystem is accessible.
+   fusey solves this without a fixed sleep:
+   - At startup: removes `{FUSEY_CACHE_DIR}/ready` if it exists (clears stale sentinel).
+   - After `gofs.Mount` returns (all S3/broker I/O complete, kernel mount established):
+     writes `{FUSEY_CACHE_DIR}/ready`.
+   - On SIGTERM/SIGINT: removes the sentinel before calling `server.Unmount()`.
+   The orchestrator polls for `{FUSEY_CACHE_DIR}/ready` and proceeds only once
+   it appears.  The invariant `sentinelIffReady` in `specs/mount.qnt` ensures
+   the sentinel is present if and only if the filesystem is accessible.
+
+9. **Environment variables** (all prefixed `FUSEY_`):
    - `FUSEY_CHUNK_SIZE` (default 64 MiB) — max chunk object size
    - `FUSEY_BLOCK_SIZE` (default 4096) — blksize reported to kernel
    - `FUSEY_MAX_SIZE` (default 1 TiB) — total filesystem capacity in bytes,
@@ -78,16 +90,16 @@ internal/
    - `FUSEY_COMPACTION_THRESHOLD` (default 0.3) — orphan fraction trigger for `fusey compact`
    - `FUSEY_PERSIST_INTERVAL` (default 30s)
 
-9. **Invariants to preserve** (from specs, enforced in implementation):
-   - `nlinkConsistency`: nlink == number of DirEntries pointing at inode (+1 for dirs)
-   - `extentSizeConsistency`: sum of extent lengths == inode.size for regular files
-   - `onlyOneActiveChunk`: exactly one chunk has status Active at any time
-   - `activeChunkBound`: active chunk size <= FUSEY_CHUNK_SIZE
-   - `lastExtentReadable`: last written extent is always within its chunk's bounds
-   - `allLiveExtentsPreserved` (compaction): no live extent lost during compaction
-   - `usedWithinBound`: sum of all regular-file sizes <= FUSEY_MAX_SIZE
+10. **Invariants to preserve** (from specs, enforced in implementation):
+    - `nlinkConsistency`: nlink == number of DirEntries pointing at inode (+1 for dirs)
+    - `extentSizeConsistency`: sum of extent lengths == inode.size for regular files
+    - `onlyOneActiveChunk`: exactly one chunk has status Active at any time
+    - `activeChunkBound`: active chunk size <= FUSEY_CHUNK_SIZE
+    - `lastExtentReadable`: last written extent is always within its chunk's bounds
+    - `allLiveExtentsPreserved` (compaction): no live extent lost during compaction
+    - `usedWithinBound`: sum of all regular-file sizes <= FUSEY_MAX_SIZE
 
-10. **Crash safety** (from compaction.qnt commitCompaction):
+11. **Crash safety** (from compaction.qnt commitCompaction):
     - Index must be persisted before old chunks are deleted
     - Recovering from crash-before-delete: old chunks still exist, re-deleting is idempotent
     - Recovering from crash-before-persist: replay from backing store index (not disk cache)
