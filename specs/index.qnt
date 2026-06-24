@@ -51,9 +51,37 @@ module index {
   var diskCache     : IndexSnapshot
   var diskCacheDirty: bool
 
+  // Shadow of the index as it was last written to the remote object store.
+  // remoteStoreDirty is set only by structural mutations (creates, deletes,
+  // renames, writes, xattrs). TouchAtime (read-access) does not set it, so
+  // atime-only updates do not trigger unnecessary presigned-URL round-trips.
+  var remoteCache     : IndexSnapshot
+  var remoteStoreDirty: bool
+
   // -------------------------------------------------------------------------
   // Pure helpers
   // -------------------------------------------------------------------------
+
+  // Compare two inode maps structurally, ignoring the atime field.
+  // TouchAtime updates atime without setting remoteStoreDirty, so the remote
+  // cache may hold stale atimes while all other inode fields remain in sync.
+  pure def inodesStructurallyEqual(a: int -> Inode, b: int -> Inode): bool =
+    a.keys() == b.keys() and
+    forall ino in a.keys():
+      val ai = a.get(ino)
+      val bi = b.get(ino)
+      ai.ino      == bi.ino      and
+      ai.fileType == bi.fileType and
+      ai.mode     == bi.mode     and
+      ai.nlink    == bi.nlink    and
+      ai.uid      == bi.uid      and
+      ai.gid      == bi.gid      and
+      ai.size     == bi.size     and
+      ai.mtime    == bi.mtime    and
+      ai.ctime    == bi.ctime    and
+      ai.blksize  == bi.blksize  and
+      ai.blocks   == bi.blocks   and
+      ai.rdev     == bi.rdev
 
   // Count how many DirEntries point to a given inode.
   pure def refCount(ino: int, entries: Set[DirEntry]): int =
@@ -179,14 +207,16 @@ module index {
       xattrs        : Map(),
       nextIno       : ROOT_INO + 1
     }
-    inodes'         = emptySnapshot.inodes
-    dirEntries'     = emptySnapshot.dirEntries
-    extentMap'      = emptySnapshot.extentMap
-    symlinkTargets' = emptySnapshot.symlinkTargets
-    xattrs'         = emptySnapshot.xattrs
-    nextIno'        = emptySnapshot.nextIno
-    diskCache'      = emptySnapshot
-    diskCacheDirty' = false
+    inodes'          = emptySnapshot.inodes
+    dirEntries'      = emptySnapshot.dirEntries
+    extentMap'       = emptySnapshot.extentMap
+    symlinkTargets'  = emptySnapshot.symlinkTargets
+    xattrs'          = emptySnapshot.xattrs
+    nextIno'         = emptySnapshot.nextIno
+    diskCache'       = emptySnapshot
+    diskCacheDirty'  = false
+    remoteCache'     = emptySnapshot
+    remoteStoreDirty' = false
   }
 
   // -------------------------------------------------------------------------
@@ -226,7 +256,8 @@ module index {
     inodes'         = inodes.set(ino, newInode)
     extentMap'      = extentMap.set(ino, List())
     nextIno'        = nextIno + 1
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Add a directory entry, incrementing the child's nlink.
@@ -243,7 +274,8 @@ module index {
     inodes'         = inodes
                         .set(childIno, { ...child,  nlink: child.nlink + 1, ctime: now })
                         .set(parentIno,{ ...parent, mtime: now, ctime: now })
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Remove a directory entry, decrementing the child's nlink.
@@ -277,7 +309,8 @@ module index {
                         symlinkTargets.remove(entry.childIno)
                       else symlinkTargets
     xattrs'         = if (newNlink == 0) xattrs.remove(entry.childIno) else xattrs
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Atomically move a directory entry (POSIX rename semantics).
@@ -298,7 +331,8 @@ module index {
       not(e.parentIno == srcParent and e.name == srcName))
     val newEntry: DirEntry = { parentIno: dstParent, name: dstName, childIno: srcEntry.childIno }
     dirEntries'     = withoutSrc.union(Set(newEntry))
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Update inode metadata (chmod, chown, utimens, truncate size field, etc.).
@@ -306,7 +340,8 @@ module index {
     require(ino.in(inodes.keys()))
     require(updated.ino == ino)
     inodes'         = inodes.set(ino, { ...updated, ctime: now })
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Append an extent to a regular file's extent list and update size/blocks.
@@ -326,7 +361,8 @@ module index {
                         mtime : now,
                         ctime : now
                       })
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Truncate a file to newSize bytes by dropping extents beyond that point
@@ -354,7 +390,8 @@ module index {
                    mtime : now,
                    ctime : now
                  })
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Record the symlink target for a symlink inode.
@@ -365,7 +402,8 @@ module index {
     symlinkTargets' = symlinkTargets.set(ino, target)
     // Store target length as the inode size (POSIX convention).
     inodes'         = inodes.set(ino, { ...inode, size: target.length(), ctime: now })
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Set or replace a single extended attribute on an inode.
@@ -375,7 +413,8 @@ module index {
     xattrs'         = xattrs.set(ino, existing.set(attrName, attrValue))
     val inode       = inodes.get(ino)
     inodes'         = inodes.set(ino, { ...inode, ctime: now })
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Remove a single extended attribute from an inode.
@@ -386,7 +425,8 @@ module index {
     xattrs'         = xattrs.set(ino, xattrs.get(ino).remove(attrName))
     val inode       = inodes.get(ino)
     inodes'         = inodes.set(ino, { ...inode, ctime: now })
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = true
   }
 
   // Update the access time of an inode (atime update on read).
@@ -394,7 +434,8 @@ module index {
     require(ino.in(inodes.keys()))
     val inode = inodes.get(ino)
     inodes'   = inodes.set(ino, { ...inode, atime: now })
-    diskCacheDirty' = true
+    diskCacheDirty'   = true
+    remoteStoreDirty' = remoteStoreDirty  // atime-only: remote store does not need updating
   }
 
   // -------------------------------------------------------------------------
@@ -412,19 +453,41 @@ module index {
       xattrs        : xattrs,
       nextIno       : nextIno
     }
-    diskCacheDirty' = false
+    diskCacheDirty'   = false
+    remoteStoreDirty' = remoteStoreDirty
   }
 
   // Restore the index from the on-disk cache (used at startup).
   // Precondition: the cache holds a valid snapshot.
   action restoreFromDisk = {
-    inodes'         = diskCache.inodes
-    dirEntries'     = diskCache.dirEntries
-    extentMap'      = diskCache.extentMap
-    symlinkTargets' = diskCache.symlinkTargets
-    xattrs'         = diskCache.xattrs
-    nextIno'        = diskCache.nextIno
-    diskCacheDirty' = false
+    inodes'           = diskCache.inodes
+    dirEntries'       = diskCache.dirEntries
+    extentMap'        = diskCache.extentMap
+    symlinkTargets'   = diskCache.symlinkTargets
+    xattrs'           = diskCache.xattrs
+    nextIno'          = diskCache.nextIno
+    diskCacheDirty'   = false
+    remoteStoreDirty' = remoteStoreDirty
+  }
+
+  // Write the current index to the remote object store.
+  //
+  // Precondition: remoteStoreDirty — this action is only useful (and only
+  // enabled) when structural mutations have occurred since the last remote
+  // write. Atime-only updates do not set remoteStoreDirty, so read-only
+  // workloads never trigger this action and never generate presigned-URL
+  // round-trips.
+  action persistToRemoteStore = {
+    require(remoteStoreDirty)
+    remoteCache' = {
+      inodes        : inodes,
+      dirEntries    : dirEntries,
+      extentMap     : extentMap,
+      symlinkTargets: symlinkTargets,
+      xattrs        : xattrs,
+      nextIno       : nextIno
+    }
+    remoteStoreDirty' = false
   }
 
   // -------------------------------------------------------------------------
@@ -440,6 +503,19 @@ module index {
       diskCache.symlinkTargets == symlinkTargets  and
       diskCache.xattrs         == xattrs          and
       diskCache.nextIno        == nextIno
+    )
+
+  // When the remote store is clean, all structural fields match memory.
+  // Atime is excluded: TouchAtime does not set remoteStoreDirty, so the
+  // remote may hold stale atimes while all structural fields are in sync.
+  invariant remoteStoreConsistencyWhenClean =
+    not(remoteStoreDirty) implies (
+      inodesStructurallyEqual(remoteCache.inodes, inodes) and
+      remoteCache.dirEntries     == dirEntries      and
+      remoteCache.extentMap      == extentMap       and
+      remoteCache.symlinkTargets == symlinkTargets  and
+      remoteCache.xattrs         == xattrs          and
+      remoteCache.nextIno        == nextIno
     )
 
   // The disk cache nextIno never exceeds the in-memory nextIno

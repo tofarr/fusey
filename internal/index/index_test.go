@@ -444,6 +444,84 @@ func TestLoadNotExist(t *testing.T) {
 	}
 }
 
+// TestRemoteDirtyFlag verifies that:
+//   - structural mutations set IsRemoteDirty()
+//   - TouchAtime (read-access) does NOT set IsRemoteDirty()
+//   - MarkRemoteClean() clears IsRemoteDirty()
+//
+// This ensures that atime-only updates from reads do not cause unnecessary
+// presigned-URL round-trips to the remote object store.
+func TestRemoteDirtyFlag(t *testing.T) {
+	idx := New(4096)
+	n := now()
+
+	// Fresh index: remote is clean.
+	if idx.IsRemoteDirty() {
+		t.Error("IsRemoteDirty: want false for a fresh index")
+	}
+
+	// CreateInode is a structural mutation → sets remoteDirty.
+	ino, err := idx.CreateInode(Regular, 0o644, 0, 0, 0, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !idx.IsRemoteDirty() {
+		t.Error("IsRemoteDirty: want true after CreateInode")
+	}
+
+	// Simulate a remote write completing.
+	idx.MarkRemoteClean()
+	if idx.IsRemoteDirty() {
+		t.Error("IsRemoteDirty: want false after MarkRemoteClean")
+	}
+
+	// AddDirEntry is a structural mutation → sets remoteDirty.
+	if err := idx.AddDirEntry(RootIno, "f.txt", ino, n); err != nil {
+		t.Fatal(err)
+	}
+	if !idx.IsRemoteDirty() {
+		t.Error("IsRemoteDirty: want true after AddDirEntry")
+	}
+	idx.MarkRemoteClean()
+
+	// TouchAtime is a read-only access — must NOT set remoteDirty.
+	idx.TouchAtime(ino, n+1)
+	if idx.IsRemoteDirty() {
+		t.Error("IsRemoteDirty: want false after TouchAtime (atime is not a structural mutation)")
+	}
+	// But IsDirty must be set (local disk cache needs updating).
+	if !idx.IsDirty() {
+		t.Error("IsDirty: want true after TouchAtime")
+	}
+
+	// WriteExtent is a structural mutation → sets remoteDirty.
+	if err := idx.WriteExtent(ino, Extent{ChunkID: "c0", ChunkOffset: 0, Length: 64, FileOffset: 0}, n); err != nil {
+		t.Fatal(err)
+	}
+	if !idx.IsRemoteDirty() {
+		t.Error("IsRemoteDirty: want true after WriteExtent")
+	}
+	idx.MarkRemoteClean()
+
+	// RemoveDirEntry (unlink) is a structural mutation → sets remoteDirty.
+	if err := idx.RemoveDirEntry(RootIno, "f.txt", n); err != nil {
+		t.Fatal(err)
+	}
+	if !idx.IsRemoteDirty() {
+		t.Error("IsRemoteDirty: want true after RemoveDirEntry")
+	}
+
+	// MarkRemoteClean leaves IsDirty unchanged.
+	idx.MarkRemoteClean()
+	if idx.IsRemoteDirty() {
+		t.Error("IsRemoteDirty: want false after MarkRemoteClean")
+	}
+	// IsDirty is governed separately; it was set by the operations above.
+	if !idx.IsDirty() {
+		t.Error("IsDirty: want true (MarkRemoteClean must not clear the local-dirty flag)")
+	}
+}
+
 func TestUsedBytes(t *testing.T) {
 	idx := New(4096)
 	n := now()

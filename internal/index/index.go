@@ -26,7 +26,8 @@ type Index struct {
 	nextIno   uint64
 	blockSize int32
 
-	dirty bool
+	dirty       bool
+	remoteDirty bool // true when structural mutations have occurred since the last remote-store write
 }
 
 // New creates an empty Index with a root directory inode.
@@ -153,6 +154,24 @@ func (idx *Index) MarkClean() {
 	idx.dirty = false
 }
 
+// IsRemoteDirty reports whether structural mutations have occurred since the
+// last successful remote-store write. Unlike IsDirty, this is not set by
+// TouchAtime so atime-only updates (reads) do not trigger presigned-URL
+// round-trips.
+func (idx *Index) IsRemoteDirty() bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.remoteDirty
+}
+
+// MarkRemoteClean resets the remote-dirty flag (called after a successful
+// write to the remote object store).
+func (idx *Index) MarkRemoteClean() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.remoteDirty = false
+}
+
 // --- Read operations (RLock) ---
 
 // GetInode returns a copy of the inode for ino, or false if it does not exist.
@@ -267,6 +286,7 @@ func (idx *Index) CreateInode(fileType FileType, mode, uid, gid, rdev uint32, no
 		idx.dirIndex[ino] = map[string]uint64{}
 	}
 	idx.dirty = true
+	idx.remoteDirty = true
 	return ino, nil
 }
 
@@ -296,6 +316,7 @@ func (idx *Index) AddDirEntry(parentIno uint64, name string, childIno uint64, no
 	parent.Mtime = now
 	parent.Ctime = now
 	idx.dirty = true
+	idx.remoteDirty = true
 	return nil
 }
 
@@ -343,6 +364,7 @@ func (idx *Index) RemoveDirEntry(parentIno uint64, name string, now int64) error
 	parent.Mtime = now
 	parent.Ctime = now
 	idx.dirty = true
+	idx.remoteDirty = true
 	return nil
 }
 
@@ -392,6 +414,7 @@ func (idx *Index) Rename(srcParent uint64, srcName string, dstParent uint64, dst
 		}
 	}
 	idx.dirty = true
+	idx.remoteDirty = true
 	return nil
 }
 
@@ -431,6 +454,7 @@ func (idx *Index) SetAttr(ino uint64, mode *uint32, uid, gid *uint32, size *int6
 	}
 	inode.Ctime = now
 	idx.dirty = true
+	idx.remoteDirty = true
 	return nil
 }
 
@@ -457,6 +481,7 @@ func (idx *Index) AppendExtent(ino uint64, ext Extent, now int64) error {
 	inode.Mtime = now
 	inode.Ctime = now
 	idx.dirty = true
+	idx.remoteDirty = true
 	return nil
 }
 
@@ -513,6 +538,7 @@ func (idx *Index) WriteExtent(ino uint64, ext Extent, now int64) error {
 	inode.Mtime = now
 	inode.Ctime = now
 	idx.dirty = true
+	idx.remoteDirty = true
 	return nil
 }
 
@@ -532,6 +558,7 @@ func (idx *Index) SetSymlink(ino uint64, target string, now int64) error {
 	inode.Size = int64(len(target))
 	inode.Ctime = now
 	idx.dirty = true
+	idx.remoteDirty = true
 	return nil
 }
 
@@ -550,6 +577,7 @@ func (idx *Index) SetXattr(ino uint64, name, value string, now int64) error {
 	idx.xattrs[ino][name] = value
 	inode.Ctime = now
 	idx.dirty = true
+	idx.remoteDirty = true
 	return nil
 }
 
@@ -569,6 +597,7 @@ func (idx *Index) RemoveXattr(ino uint64, name string, now int64) error {
 	delete(attrs, name)
 	inode.Ctime = now
 	idx.dirty = true
+	idx.remoteDirty = true
 	return nil
 }
 
@@ -647,6 +676,7 @@ func (idx *Index) RemapExtents(remap map[[2]interface{}]Extent) {
 		idx.extents[ino] = exts
 	}
 	idx.dirty = true
+	idx.remoteDirty = true
 }
 
 // trimExtents removes or trims extents beyond newSize (called with lock held).
