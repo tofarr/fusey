@@ -186,8 +186,8 @@ func TestS3ListExcludesIndex(t *testing.T) {
 		t.Fatalf("List: %v", err)
 	}
 	for _, id := range ids {
-		if id == "index.json" {
-			t.Error("List must not return index.json as a chunk ID")
+		if id == "index.cbor" {
+			t.Error("List must not return index.cbor as a chunk ID")
 		}
 	}
 }

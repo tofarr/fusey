@@ -412,7 +412,7 @@ func TestPersistRoundtrip(t *testing.T) {
 
 	ino, _ := idx.CreateInode(Regular, 0o644, 1000, 1000, 0, n)
 	idx.AddDirEntry(RootIno, "persisted.txt", ino, n)
-	idx.WriteExtent(ino, Extent{ChunkID: "c0", ChunkOffset: 0, Length: 42, FileOffset: 0}, n)
+	idx.WriteExtent(ino, Extent{ChunkID: "chunk-00000000", ChunkOffset: 0, Length: 42, FileOffset: 0}, n)
 
 	if err := Save(idx, dir); err != nil {
 		t.Fatal(err)

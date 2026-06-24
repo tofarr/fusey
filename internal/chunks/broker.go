@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const brokerIndexKey = "index.json"
+const brokerIndexKey = "index.cbor"
 
 // BrokerStore implements ObjectStore using a two-phase presigned-URL protocol.
 // The broker holds object-store credentials; fusey authenticates with a single
@@ -35,7 +35,7 @@ const brokerIndexKey = "index.json"
 //  1. GET /objects/{id}/download-url → {"url":"https://s3…"}  (auth header required)
 //  2. GET the presigned URL with a Range header            (no auth header; creds in URL)
 //
-// The filesystem index is stored under the reserved ID "index.json". List()
+// The filesystem index is stored under the reserved ID "index.cbor". List()
 // excludes this ID so it is never treated as a chunk by the compactor.
 type BrokerStore struct {
 	baseURL    string
@@ -214,7 +214,7 @@ func (s *BrokerStore) Delete(ctx context.Context, id string) error {
 }
 
 // List returns the IDs of all chunk objects via the broker.
-// The index key ("index.json") is excluded so it is never treated as a chunk
+// The index key ("index.cbor") is excluded so it is never treated as a chunk
 // by the compactor.
 func (s *BrokerStore) List(ctx context.Context) ([]string, error) {
 	req, err := s.newRequest(ctx, http.MethodGet, s.baseURL+"/objects", nil)

@@ -389,8 +389,8 @@ func TestBrokerUnauthorized(t *testing.T) {
 
 func TestBrokerIndexKeyConstant(t *testing.T) {
 	store, _ := newBrokerTestSetup(t)
-	if store.IndexKey() != "index.json" {
-		t.Errorf("IndexKey: got %q, want %q", store.IndexKey(), "index.json")
+	if store.IndexKey() != "index.cbor" {
+		t.Errorf("IndexKey: got %q, want %q", store.IndexKey(), "index.cbor")
 	}
 }
 

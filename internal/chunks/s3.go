@@ -118,7 +118,7 @@ func (s *S3Store) Delete(ctx context.Context, id string) error {
 }
 
 // List returns the IDs of all chunk objects in the bucket under the configured
-// prefix. The index object (index.json) is excluded from the result.
+// prefix. The index object (index.cbor) is excluded from the result.
 // Handles S3 pagination transparently.
 func (s *S3Store) List(ctx context.Context) ([]string, error) {
 	var ids []string
@@ -137,7 +137,7 @@ func (s *S3Store) List(ctx context.Context) ([]string, error) {
 				continue
 			}
 			id := strings.TrimPrefix(*obj.Key, s.prefix)
-			if id == "index.json" {
+			if id == "index.cbor" {
 				continue // never expose the index as a chunk
 			}
 			ids = append(ids, id)
@@ -166,7 +166,7 @@ func (s *S3Store) Size(ctx context.Context, id string) (int64, error) {
 }
 
 // PutRaw writes data to an arbitrary key in the bucket without the chunk
-// prefix. Used to persist the index snapshot (key = "{prefix}index.json").
+// prefix. Used to persist the index snapshot (key = "{prefix}index.cbor").
 func (s *S3Store) PutRaw(ctx context.Context, key string, data []byte) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
@@ -202,9 +202,9 @@ func (s *S3Store) GetRaw(ctx context.Context, key string) ([]byte, error) {
 }
 
 // IndexKey returns the S3 key used to store the index snapshot.
-// It lives at {prefix}index.json within the bucket.
+// It lives at {prefix}index.cbor within the bucket.
 func (s *S3Store) IndexKey() string {
-	return s.prefix + "index.json"
+	return s.prefix + "index.cbor"
 }
 
 // isS3NotFound reports whether err represents a missing object (HTTP 404 /

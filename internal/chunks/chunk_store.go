@@ -54,7 +54,7 @@ func NewChunkStore(store Store, maxChunkSize int64) *ChunkStore {
 //
 // Call once after NewChunkStore before the first Append or Read. On a
 // genuinely fresh filesystem with no existing chunks this is a no-op.
-// Non-chunk object IDs (compacted-*, index.json) are ignored.
+// Non-chunk object IDs (compacted-*, index.cbor) are ignored.
 func (cs *ChunkStore) RecoverNextSeq(ctx context.Context) error {
 	ids, err := cs.store.List(ctx)
 	if err != nil {
