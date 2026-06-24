@@ -48,7 +48,7 @@ type Config struct {
 	ForcePathStyle bool
 	// Prefix is prepended to every object key in the bucket (FUSEY_PREFIX).
 	// Use this when multiple Fusey instances share a single bucket; e.g. "pod-abc/".
-	// Chunks are stored as {Prefix}chunk-XXXXXXXX; the index as {Prefix}index.json.
+	// Chunks are stored as {Prefix}chunk-XXXXXXXX; the index as {Prefix}index.cbor.
 	Prefix string
 
 	// --- Broker store (alternative to direct S3) ---
