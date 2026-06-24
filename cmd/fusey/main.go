@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -45,8 +46,23 @@ func main() {
 }
 
 // runMount mounts the FUSE filesystem and blocks until a signal is received.
+//
+// Ready-signal protocol (see specs/mount.qnt):
+//
+//  1. Any sentinel left by a previous run is removed before startup work begins,
+//     so that an orchestrator polling the file cannot observe a stale ready signal.
+//  2. After gofs.Mount returns (meaning the kernel FUSE mount is established and
+//     all startup I/O — index load, broker handshake — is complete), the sentinel
+//     file {CacheDir}/ready is written.  An orchestrator that polls for this file
+//     is guaranteed to see an accessible filesystem once it appears.
+//  3. The sentinel is removed before unmount begins so that the file is never
+//     present when the filesystem is no longer usable.
 func runMount(mountpoint string) {
 	cfg := mustLoadConfig()
+
+	// Step 1: remove any stale sentinel from a prior run.
+	readyPath := filepath.Join(cfg.CacheDir, "ready")
+	_ = os.Remove(readyPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -69,6 +85,12 @@ func runMount(mountpoint string) {
 	}
 	log.Printf("fusey mounted at %s", mountpoint)
 
+	// Step 2: signal readiness.  The filesystem is now accessible; write the
+	// sentinel so that any orchestrator polling for it can proceed.
+	if err := os.WriteFile(readyPath, []byte("ready\n"), 0644); err != nil {
+		log.Printf("warn: could not write ready sentinel %s: %v", readyPath, err)
+	}
+
 	// Periodic index persistence.
 	go func() {
 		ticker := time.NewTicker(cfg.PersistInterval)
@@ -87,7 +109,10 @@ func runMount(mountpoint string) {
 	<-sig
 	cancel()
 
+	// Step 3: remove sentinel before unmounting so it is never present when
+	// the filesystem is no longer usable.
 	log.Println("unmounting...")
+	_ = os.Remove(readyPath)
 	if err := server.Unmount(); err != nil {
 		log.Printf("unmount: %v", err)
 	}
