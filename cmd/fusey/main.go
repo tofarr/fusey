@@ -166,19 +166,26 @@ func mustBuildStore(ctx context.Context, cfg *config.Config) (chunks.ObjectStore
 	return objStore, cs
 }
 
-// buildPersistFn returns a function that atomically flushes the active chunk
-// and then writes the index to local disk and the object store.
+// buildPersistFn returns a function that persists the index locally and then
+// to the remote object store.
 //
-// FlushActive is called first so the remote store is always self-consistent:
-// every extent the persisted index references exists as an object in the store.
-// This bounds the data-loss window to at most one FUSEY_PERSIST_INTERVAL on
-// any crash, including OOM kills where no signal handler runs.
+// Ordering rationale:
+//  1. index.Save (local disk) — always runs first. The broker's availability
+//     must not gate the local durability guarantee; the pod must be able to
+//     recover from its local cache even if the remote write fails.
+//  2. cs.FlushActive (remote chunk) — runs before the remote index write so
+//     the remote store is always self-consistent: every extent the persisted
+//     index references exists as a chunk object in the store. If this fails,
+//     the function returns the error (which the caller logs) but the local
+//     cache is already up to date.
+//  3. store.PutRaw (remote index) — written last, only if the chunk flush
+//     succeeded, preserving remote-store consistency.
 func buildPersistFn(ctx context.Context, cfg *config.Config, idx *index.Index, cs *chunks.ChunkStore, store chunks.ObjectStore) func() error {
 	return func() error {
-		if err := cs.FlushActive(ctx); err != nil {
+		if err := index.Save(idx, cfg.CacheDir); err != nil {
 			return err
 		}
-		if err := index.Save(idx, cfg.CacheDir); err != nil {
+		if err := cs.FlushActive(ctx); err != nil {
 			return err
 		}
 		data, err := index.Marshal(idx)
