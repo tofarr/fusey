@@ -17,7 +17,7 @@
 //   GET    /objects                — list all object IDs
 //
 // Index persistence reuses the same endpoints with a reserved ID
-// ("index.json").  List() excludes this ID so it is never treated as a chunk.
+// ("index.cbor").  List() excludes this ID so it is never treated as a chunk.
 //
 // Byte contents are not modelled; we track only presence and sizes, because
 // those are what the chunk store and index correctness properties depend on.
