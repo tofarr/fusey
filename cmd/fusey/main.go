@@ -2,17 +2,26 @@
 //
 // Subcommands:
 //
-//	fusey mount <mountpoint>  — mount the filesystem and serve FUSE requests
-//	fusey compact             — run one compaction cycle and exit
+//	fusey mount <mountpoint>    — start a background daemon; exits when mount is operational
+//	fusey unmount <mountpoint>  — terminate the daemon serving the given mountpoint
+//	fusey compact               — run one compaction cycle and exit
 //
 // All configuration is via FUSEY_* environment variables (see README).
+// Each mount gets its own subdirectory under FUSEY_CACHE_DIR named by a random
+// daemon ID: <FUSEY_CACHE_DIR>/<daemonID>/{index.cbor,chunks/,daemon.pid,fusey.log}.
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -28,9 +37,16 @@ import (
 	"github.com/tofarr/fusey/internal/index"
 )
 
+// daemonInfo is written as JSON to <daemonDir>/daemon.pid so that
+// `fusey unmount` can find and terminate the right background process.
+type daemonInfo struct {
+	PID        int    `json:"pid"`
+	Mountpoint string `json:"mountpoint"`
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		log.Fatal("usage: fusey <mount|compact> [args]")
+		log.Fatal("usage: fusey <mount|unmount|compact> [args]")
 	}
 	switch os.Args[1] {
 	case "mount":
@@ -38,38 +54,108 @@ func main() {
 			log.Fatal("usage: fusey mount <mountpoint>")
 		}
 		runMount(os.Args[2])
+	case "daemon": // internal subcommand — launched by runMount; not for direct use
+		if len(os.Args) != 4 {
+			log.Fatal("usage: fusey daemon <daemonID> <mountpoint>")
+		}
+		runDaemon(os.Args[2], os.Args[3])
+	case "unmount":
+		if len(os.Args) != 3 {
+			log.Fatal("usage: fusey unmount <mountpoint>")
+		}
+		runUnmount(os.Args[2])
 	case "compact":
 		runCompact()
 	default:
-		log.Fatalf("unknown subcommand %q; use 'mount' or 'compact'", os.Args[1])
+		log.Fatalf("unknown subcommand %q; use 'mount', 'unmount', or 'compact'", os.Args[1])
 	}
 }
 
-// runMount mounts the FUSE filesystem and blocks until a signal is received.
+// runMount spawns a background daemon for the given mountpoint and blocks
+// until the daemon signals that the FUSE mount is established. It then exits
+// with status 0, leaving the daemon running in the background.
 //
-// Ready-signal protocol (see specs/mount.qnt):
-//
-//  1. Any sentinel left by a previous run is removed before startup work begins,
-//     so that an orchestrator polling the file cannot observe a stale ready signal.
-//  2. After gofs.Mount returns (meaning the kernel FUSE mount is established and
-//     all startup I/O — index load, broker handshake — is complete), the sentinel
-//     file {CacheDir}/ready is written.  An orchestrator that polls for this file
-//     is guaranteed to see an accessible filesystem once it appears.
-//  3. The sentinel is removed before unmount begins so that the file is never
-//     present when the filesystem is no longer usable.
+// The daemon is launched as: fusey daemon <daemonID> <mountpoint>
+// A pipe (fd 3 in the daemon) carries a single "ready\n" line back to the
+// parent once gofs.Mount has returned. If the pipe closes without that signal
+// the daemon failed; the parent exits non-zero and refers the user to the log.
 func runMount(mountpoint string) {
 	cfg := mustLoadConfig()
 
-	// Step 1: remove any stale sentinel from a prior run.
-	readyPath := filepath.Join(cfg.CacheDir, "ready")
-	_ = os.Remove(readyPath)
+	daemonID := newDaemonID()
+	daemonDir := filepath.Join(cfg.CacheDir, daemonID)
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		log.Fatalf("create daemon dir: %v", err)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		log.Fatalf("pipe: %v", err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatalf("executable: %v", err)
+	}
+	cmd := exec.Command(exe, "daemon", daemonID, mountpoint)
+	cmd.Env = os.Environ()
+	cmd.ExtraFiles = []*os.File{w} // becomes fd 3 in the daemon
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("start daemon: %v", err)
+	}
+	w.Close()
+
+	buf, err := io.ReadAll(r)
+	r.Close()
+	if err != nil || string(buf) != "ready\n" {
+		log.Fatalf("daemon failed to mount; check %s", filepath.Join(daemonDir, "fusey.log"))
+	}
+
+	fmt.Printf("fusey: mounted %s (daemon %s)\n", mountpoint, daemonID)
+}
+
+// runDaemon is the long-running background process that serves FUSE requests.
+// It is started by runMount and is not intended to be invoked directly.
+//
+// Protocol (see specs/mount.qnt):
+//  1. Opens <daemonDir>/fusey.log and redirects all log output there.
+//  2. Scopes cfg.CacheDir to <baseDir>/<daemonID> so all on-disk artefacts
+//     (index.cbor, chunks/) are isolated to this mount instance.
+//  3. Performs the FUSE mount. On success it writes a JSON PID file and sends
+//     "ready\n" to the parent via fd 3 (the pipe write end); the parent exits.
+//  4. Serves FUSE requests until SIGINT or SIGTERM, then unmounts, flushes the
+//     index, removes the PID file, and exits.
+func runDaemon(daemonID, mountpoint string) {
+	cfg := mustLoadConfig()
+
+	daemonDir := filepath.Join(cfg.CacheDir, daemonID)
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		log.Fatalf("daemon dir: %v", err)
+	}
+
+	logFile, err := os.OpenFile(
+		filepath.Join(daemonDir, "fusey.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0644,
+	)
+	if err != nil {
+		log.Fatalf("open log: %v", err)
+	}
+	defer logFile.Close()
+	log.SetOutput(logFile)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	// fd 3 is the write end of the ready pipe; closing it signals failure.
+	readyPipe := os.NewFile(3, "ready-pipe")
+
+	cfg.CacheDir = daemonDir // isolate all on-disk artefacts to this daemon
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	objStore, cs := mustBuildStore(ctx, cfg)
 	idx := loadIndex(ctx, cfg, objStore)
-
 	persistFn := buildPersistFn(ctx, cfg, idx, cs, objStore)
 
 	f := fusefs.New(idx, cs, cfg.MaxFSSize, cfg.CacheDir)
@@ -77,19 +163,24 @@ func runMount(mountpoint string) {
 		MountOptions: fuse.MountOptions{
 			FsName:      "fusey",
 			AllowOther:  false,
-			DirectMount: true, // use mount(2) directly; requires CAP_SYS_ADMIN but avoids fusermount dependency
+			DirectMount: true,
 		},
 	})
 	if err != nil {
+		readyPipe.Close() // EOF on parent's read end signals mount failure
 		log.Fatalf("mount: %v", err)
 	}
-	log.Printf("fusey mounted at %s", mountpoint)
+	log.Printf("mounted at %s (daemon %s)", mountpoint, daemonID)
 
-	// Step 2: signal readiness.  The filesystem is now accessible; write the
-	// sentinel so that any orchestrator polling for it can proceed.
-	if err := os.WriteFile(readyPath, []byte("ready\n"), 0644); err != nil {
-		log.Printf("warn: could not write ready sentinel %s: %v", readyPath, err)
-	}
+	// Write PID file for unmount lookup before signalling the parent, so that
+	// `fusey unmount` cannot race against a daemon that has not yet written it.
+	pidPath := filepath.Join(daemonDir, "daemon.pid")
+	pidData, _ := json.Marshal(daemonInfo{PID: os.Getpid(), Mountpoint: mountpoint})
+	_ = os.WriteFile(pidPath, append(pidData, '\n'), 0644)
+
+	// Signal the parent: filesystem is accessible; parent will exit 0.
+	_, _ = fmt.Fprint(readyPipe, "ready\n")
+	readyPipe.Close()
 
 	// Periodic index persistence.
 	go func() {
@@ -109,23 +200,66 @@ func runMount(mountpoint string) {
 	<-sig
 	cancel()
 
-	// Step 3: remove sentinel before unmounting so it is never present when
-	// the filesystem is no longer usable.
 	log.Println("unmounting...")
-	_ = os.Remove(readyPath)
 	if err := server.Unmount(); err != nil {
 		log.Printf("unmount: %v", err)
 	}
 	if err := persistFn(); err != nil {
 		log.Printf("final persist: %v", err)
 	}
+	_ = os.Remove(pidPath)
 	log.Println("done")
 }
 
+// runUnmount scans <FUSEY_CACHE_DIR>/*/daemon.pid to find the daemon serving
+// mountpoint and sends it SIGTERM. The daemon handles the signal by unmounting,
+// flushing the index, and exiting.
+func runUnmount(mountpoint string) {
+	cfg := mustLoadConfig()
+
+	abs, err := filepath.Abs(mountpoint)
+	if err != nil {
+		log.Fatalf("resolve mountpoint: %v", err)
+	}
+
+	entries, err := os.ReadDir(cfg.CacheDir)
+	if err != nil {
+		log.Fatalf("read cache dir %s: %v", cfg.CacheDir, err)
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pidPath := filepath.Join(cfg.CacheDir, e.Name(), "daemon.pid")
+		data, err := os.ReadFile(pidPath)
+		if err != nil {
+			continue
+		}
+		var info daemonInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			continue
+		}
+		infoAbs, _ := filepath.Abs(info.Mountpoint)
+		if infoAbs != abs {
+			continue
+		}
+		proc, err := os.FindProcess(info.PID)
+		if err != nil {
+			log.Fatalf("find process %d: %v", info.PID, err)
+		}
+		if err := proc.Signal(syscall.SIGTERM); err != nil {
+			log.Fatalf("signal daemon %d: %v", info.PID, err)
+		}
+		fmt.Printf("fusey: sent SIGTERM to daemon %s (pid %d)\n", e.Name(), info.PID)
+		return
+	}
+
+	log.Fatalf("no active daemon found for mountpoint %s", mountpoint)
+}
+
 // runCompact loads the index from S3, runs one compaction cycle, persists the
-// updated index, and exits. Intended to be called from a Kubernetes CronJob:
-//
-//	fusey compact
+// updated index, and exits. Intended to be called from a Kubernetes CronJob.
 func runCompact() {
 	cfg := mustLoadConfig()
 	ctx := context.Background()
@@ -208,18 +342,14 @@ func mustBuildStore(ctx context.Context, cfg *config.Config) (chunks.ObjectStore
 //     read workloads generate no presigned-URL round-trips.
 func buildPersistFn(ctx context.Context, cfg *config.Config, idx *index.Index, cs *chunks.ChunkStore, store chunks.ObjectStore) func() error {
 	return func() error {
-		// Step 1: persist index to local cache when it has diverged.
 		if idx.IsDirty() {
 			if err := index.Save(idx, cfg.CacheDir); err != nil {
 				return err
 			}
 		}
-		// Step 2: flush the active chunk (no-op when unmodified since last flush).
 		if err := cs.FlushActive(ctx); err != nil {
 			return err
 		}
-		// Step 3: upload the index to the remote store only when structural
-		// mutations have occurred since the last remote write.
 		if !idx.IsRemoteDirty() {
 			return nil
 		}
@@ -267,4 +397,14 @@ func loadIndex(ctx context.Context, cfg *config.Config, store chunks.ObjectStore
 
 	log.Printf("no existing index found; starting fresh filesystem")
 	return index.New(cfg.BlockSize)
+}
+
+// newDaemonID returns a random 16-character hex string that uniquely identifies
+// a daemon instance and names its subdirectory under FUSEY_CACHE_DIR.
+func newDaemonID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("generate daemon ID: %v", err)
+	}
+	return hex.EncodeToString(b)
 }

@@ -47,8 +47,12 @@ internal/
    complete without any I/O.
 
 5. **Disk cache format**: CBOR via `github.com/fxamacker/cbor/v2`.
-   The cache file lives in `FUSEY_CACHE_DIR/index.cbor`.
-   The same bytes are written to S3/broker as `{prefix}index.cbor`.
+   Each daemon instance gets its own subdirectory under `FUSEY_CACHE_DIR`:
+   `FUSEY_CACHE_DIR/<daemonID>/index.cbor` (local index cache),
+   `FUSEY_CACHE_DIR/<daemonID>/chunks/` (sealed chunk cache),
+   `FUSEY_CACHE_DIR/<daemonID>/daemon.pid` (JSON: `{"pid":N,"mountpoint":"/path"}`),
+   `FUSEY_CACHE_DIR/<daemonID>/fusey.log` (daemon log output).
+   The same index bytes are written to S3/broker as `{prefix}index.cbor`.
    Wire format uses private types with integer CBOR map keys (keyasint) for
    compact per-record encoding; chunk IDs are stored as uint32 sequence numbers
    instead of the full "chunk-NNNNNNNN" string (~11 bytes saved per extent).
@@ -61,17 +65,22 @@ internal/
    then flushes to S3 (or local cache) before returning to the kernel. The
    index is updated in memory immediately and persisted asynchronously.
 
-8. **Mount ready-signal protocol** (see `specs/mount.qnt`):
-   The orchestrator (runtime-api) launches `fusey mount` as a background process
-   and must not proceed to `/api/init` until the FUSE filesystem is accessible.
-   fusey solves this without a fixed sleep:
-   - At startup: removes `{FUSEY_CACHE_DIR}/ready` if it exists (clears stale sentinel).
-   - After `gofs.Mount` returns (all S3/broker I/O complete, kernel mount established):
-     writes `{FUSEY_CACHE_DIR}/ready`.
-   - On SIGTERM/SIGINT: removes the sentinel before calling `server.Unmount()`.
-   The orchestrator polls for `{FUSEY_CACHE_DIR}/ready` and proceeds only once
-   it appears.  The invariant `sentinelIffReady` in `specs/mount.qnt` ensures
-   the sentinel is present if and only if the filesystem is accessible.
+8. **Daemon-based mount** (see `specs/mount.qnt`):
+   `fusey mount <mountpoint>` starts the filesystem and exits 0 as soon as it
+   is operational — no polling, no fixed sleep.  Multiple mounts are supported.
+   - `fusey mount` generates a random daemon ID, creates `FUSEY_CACHE_DIR/<daemonID>/`,
+     creates an OS pipe, then forks `fusey daemon <daemonID> <mountpoint>` (detached,
+     new session).  The write end of the pipe is fd 3 in the daemon.
+   - The daemon redirects all log output to `<daemonDir>/fusey.log`, sets its
+     effective `CacheDir` to `<daemonDir>`, performs all S3/broker I/O, and calls
+     `gofs.Mount`. On success it writes `<daemonDir>/daemon.pid` (JSON `{"pid":N,
+     "mountpoint":"/path"}`) and sends `"ready\n"` to fd 3.
+   - The parent reads the pipe: `"ready\n"` → exit 0; EOF without it → exit non-zero.
+   - `fusey unmount <mountpoint>` scans `FUSEY_CACHE_DIR/*/daemon.pid`, finds the
+     matching entry, and sends SIGTERM.  The daemon unmounts, flushes the index,
+     removes the PID file, and exits.
+   Invariants are modelled in `specs/mount.qnt`: `fsAccessibleIffDaemonReady`,
+   `pidFileGoneWhenStopped`, `parentDoneImpliesSignalled`.
 
 9. **Environment variables** (all prefixed `FUSEY_`):
    - `FUSEY_CHUNK_SIZE` (default 64 MiB) — max chunk object size
