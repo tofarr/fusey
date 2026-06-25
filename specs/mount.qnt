@@ -1,27 +1,31 @@
 // mount.qnt
 //
-// Specification of the fusey mount process lifecycle and ready-signal protocol.
+// Specification of the fusey daemon-based mount lifecycle.
 //
-// Problem being modelled:
-//   fusey is launched as a background process by an external orchestrator
-//   (the runtime-api).  The orchestrator must not send /api/init to the
-//   agent-server until the FUSE filesystem is fully accessible.  Previously
-//   the orchestrator used a fixed sleep, which is inherently racy because
-//   fusey's startup time varies: it must (1) load config, (2) connect to the
-//   broker/S3, (3) load the index, and (4) call mount(2) before the
-//   filesystem is usable.
+// Design overview:
+//   `fusey mount <mountpoint>` forks a background daemon
+//   (`fusey daemon <id> <mountpoint>`) and exits as soon as the mount is
+//   operational.  Multiple mounts are supported concurrently; each daemon
+//   gets an isolated subdirectory under FUSEY_CACHE_DIR named by a random
+//   daemon ID, and writes a JSON PID file there so that `fusey unmount`
+//   can locate and terminate the right process.
 //
-// Solution being modelled:
-//   fusey writes a sentinel file ({FUSEY_CACHE_DIR}/ready) after mount(2)
-//   returns successfully.  The orchestrator polls for this file; once it
-//   appears the filesystem is guaranteed accessible.  The sentinel is removed
-//   at process start (to clear stale files from prior runs) and again just
-//   before unmount.
+// Ready-signal protocol:
+//   The parent creates an OS pipe before forking.  The write end (fd 3) is
+//   inherited by the daemon.  Once gofs.Mount returns the daemon writes
+//   "ready\n" to fd 3 and closes it.  The parent reads the pipe; when it
+//   receives "ready\n" it exits 0.  If the pipe closes without that string
+//   the daemon failed and the parent exits non-zero.
 //
 // Correspondence to Go implementation (cmd/fusey/main.go):
-//   Initializing  → process started, before gofs.Mount returns
-//   Ready         → after gofs.Mount returns; sentinel file written
-//   Stopped       → after SIGTERM/SIGINT received; sentinel removed; unmount complete
+//   ParentForking     → runMount before cmd.Start
+//   ParentWaiting     → runMount blocking on io.ReadAll(r)
+//   ParentDone        → runMount after fmt.Printf; exits 0
+//   ParentFailed      → runMount after log.Fatalf; exits non-zero
+//   DaemonStarting    → runDaemon before gofs.Mount
+//   DaemonReady       → runDaemon after gofs.Mount and PID file written
+//   DaemonStopping    → runDaemon after signal received
+//   DaemonStopped     → runDaemon after server.Unmount and os.Remove(pidPath)
 
 module mount {
 
@@ -29,93 +33,152 @@ module mount {
   // Types
   // --------------------------------------------------------------------------
 
-  type MountState =
-    | Initializing  // startup: loading config, index, calling mount(2)
-    | Ready         // FUSE mount established; filesystem accessible
-    | Stopped       // unmount complete; process will exit
+  type ParentState =
+    | ParentForking    // setting up pipe and starting daemon process
+    | ParentWaiting    // blocking on pipe read; daemon still initialising
+    | ParentDone       // received "ready\n"; exited 0
+    | ParentFailed     // pipe closed without "ready\n"; exited non-zero
+
+  type DaemonState =
+    | DaemonStarting   // loading config, connecting to store, loading index
+    | DaemonReady      // gofs.Mount succeeded; PID file written; serving FUSE
+    | DaemonStopping   // SIGTERM/SIGINT received; running unmount
+    | DaemonStopped    // unmount complete; PID file removed; process exited
 
   // --------------------------------------------------------------------------
   // State
   // --------------------------------------------------------------------------
 
-  // Lifecycle position of the fusey process.
-  var mountState: MountState
-
-  // Whether the ready sentinel file exists on disk.
-  // In the implementation this is {FUSEY_CACHE_DIR}/ready.
-  var sentinelExists: bool
+  var parentState:    ParentState
+  var daemonState:    DaemonState
+  var pipeSignalled:  bool  // daemon has written "ready\n" and closed pipe
+  var pidFileExists:  bool  // <daemonDir>/daemon.pid is on disk
+  var fsAccessible:   bool  // FUSE filesystem is usable by other processes
 
   // --------------------------------------------------------------------------
   // Initialisation
   // --------------------------------------------------------------------------
 
-  // At process start the sentinel from any previous run is removed (the
-  // implementation calls os.Remove before doing any other work).
   action init = {
-    mountState'    = Initializing
-    sentinelExists' = false
+    parentState'   = ParentForking
+    daemonState'   = DaemonStarting
+    pipeSignalled' = false
+    pidFileExists' = false
+    fsAccessible'  = false
   }
 
   // --------------------------------------------------------------------------
   // Actions
   // --------------------------------------------------------------------------
 
-  // becomeReady: fusey has finished loading the index and mount(2) has
-  // returned successfully.  The FUSE filesystem is now accessible to other
-  // processes.  The sentinel file is written atomically before this action
-  // completes so that any poller that observes the sentinel is guaranteed
-  // to see a working filesystem.
-  //
-  // Corresponds to: the os.WriteFile(readyPath, ...) call in runMount,
-  // executed immediately after gofs.Mount returns without error.
-  action becomeReady = {
-    require(mountState == Initializing)
-    mountState'    = Ready
-    sentinelExists' = true
+  // Parent finishes forking the daemon and starts waiting on the pipe.
+  action parentStartsWaiting = {
+    require(parentState == ParentForking)
+    parentState' = ParentWaiting
   }
 
-  // beginUnmount: a shutdown signal (SIGTERM or SIGINT) is received.
-  // The sentinel is removed before unmount begins so that any poller
-  // that is still running will not see the sentinel after the filesystem
-  // is torn down.
-  //
-  // Corresponds to: os.Remove(readyPath) called in the signal handler,
-  // before server.Unmount().
-  action beginUnmount = {
-    require(mountState == Ready)
-    mountState'    = Stopped
-    sentinelExists' = false
+  // Daemon successfully completes gofs.Mount.
+  // It writes the PID file, then writes "ready\n" to the pipe and closes it.
+  // Both happen atomically from the model's perspective: the parent cannot
+  // read from the pipe before the PID file is on disk.
+  action daemonMountsSuccessfully = {
+    require(daemonState == DaemonStarting)
+    daemonState'   = DaemonReady
+    fsAccessible'  = true
+    pidFileExists' = true
+    pipeSignalled' = true
+  }
+
+  // Daemon fails before or during gofs.Mount.
+  // It closes the pipe without writing "ready\n" and exits.
+  action daemonMountFails = {
+    require(daemonState == DaemonStarting)
+    daemonState'   = DaemonStopped
+    fsAccessible'  = false
+    pidFileExists' = false
+    pipeSignalled' = false
+  }
+
+  // Parent reads "ready\n" from the pipe and exits 0.
+  // Precondition: pipe was signalled (daemon wrote "ready\n" and closed it).
+  action parentSucceeds = {
+    require(parentState == ParentWaiting)
+    require(pipeSignalled)
+    parentState' = ParentDone
+  }
+
+  // Parent reads EOF from the pipe without receiving "ready\n" and exits non-zero.
+  action parentFails = {
+    require(parentState == ParentWaiting)
+    require(not(pipeSignalled))
+    require(daemonState == DaemonStopped) // pipe closed because daemon exited
+    parentState' = ParentFailed
+  }
+
+  // A signal (SIGTERM or SIGINT) triggers daemon shutdown.
+  // Only possible while the daemon is serving (DaemonReady).
+  action daemonReceivesSignal = {
+    require(daemonState == DaemonReady)
+    daemonState' = DaemonStopping
+  }
+
+  // `fusey unmount` finds the PID file, resolves the PID, and sends SIGTERM.
+  // This is the same outcome as daemonReceivesSignal but named for clarity.
+  action unmountCommandSendsSignal = {
+    require(daemonState == DaemonReady)
+    require(pidFileExists)
+    daemonState' = DaemonStopping
+  }
+
+  // Daemon finishes unmounting and cleans up.
+  action daemonStops = {
+    require(daemonState == DaemonStopping)
+    daemonState'  = DaemonStopped
+    fsAccessible' = false
+    pidFileExists' = false
   }
 
   // --------------------------------------------------------------------------
   // Invariants
   // --------------------------------------------------------------------------
 
-  // Core invariant: the sentinel file exists if and only if the mount is Ready.
-  // This is the safety property the orchestrator's poll relies on.
-  invariant sentinelIffReady =
-    sentinelExists iff mountState == Ready
+  // The parent only exits successfully when the daemon signalled readiness.
+  invariant parentDoneImpliesSignalled =
+    parentState == ParentDone implies pipeSignalled
 
-  // The filesystem is never both stopped and ready.
-  invariant notStoppedAndReady =
-    not(mountState == Stopped and sentinelExists)
+  // The filesystem is accessible only when the daemon is actively serving.
+  invariant fsAccessibleIffDaemonReady =
+    fsAccessible iff daemonState == DaemonReady
+
+  // The PID file exists while the daemon is serving or shutting down so that
+  // `fusey unmount` can always find a ready daemon.
+  invariant pidFileExistsWhileReachable =
+    pidFileExists implies (daemonState == DaemonReady or daemonState == DaemonStopping)
+
+  // When the daemon has stopped the PID file is gone.
+  invariant pidFileGoneWhenStopped =
+    daemonState == DaemonStopped implies not(pidFileExists)
+
+  // The filesystem is never accessible after the daemon has stopped.
+  invariant fsInaccessibleWhenStopped =
+    daemonState == DaemonStopped implies not(fsAccessible)
 
   // --------------------------------------------------------------------------
   // Temporal properties
   // --------------------------------------------------------------------------
 
-  // Once startup begins, Ready is eventually reached (liveness: fusey always
-  // finishes mounting under fair scheduling).
-  temporal eventualReady =
-    always(mountState == Initializing implies eventually(mountState == Ready))
+  // The parent eventually resolves (exits 0 or non-zero).
+  temporal parentEventuallyResolves =
+    always(parentState == ParentWaiting implies
+      eventually(parentState == ParentDone or parentState == ParentFailed))
 
-  // Once Ready, the process eventually stops (liveness: fusey always
-  // terminates when a signal arrives).
-  temporal eventualStop =
-    always(mountState == Ready implies eventually(mountState == Stopped))
+  // A signalled daemon eventually stops.
+  temporal daemonEventuallyStops =
+    always(daemonState == DaemonStopping implies eventually(daemonState == DaemonStopped))
 
-  // The sentinel is never present in a Stopped or Initializing state.
-  temporal sentinelOnlyWhileReady =
-    always(sentinelExists implies mountState == Ready)
+  // Once the daemon is ready, it eventually receives a shutdown signal.
+  temporal daemonEventuallyReceivesSignal =
+    always(daemonState == DaemonReady implies
+      eventually(daemonState == DaemonStopping or daemonState == DaemonStopped))
 
 }
