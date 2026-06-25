@@ -422,9 +422,9 @@ func TestFsync(t *testing.T) {
 	f.Close()
 
 	// The index snapshot must have been written to cacheDir.
-	indexPath := filepath.Join(cacheDir, "index.json")
+	indexPath := filepath.Join(cacheDir, "index.cbor")
 	if _, err := os.Stat(indexPath); err != nil {
-		t.Errorf("index.json missing after fsync: %v", err)
+		t.Errorf("index.cbor missing after fsync: %v", err)
 	}
 
 	// Data must still be readable after fsync.
