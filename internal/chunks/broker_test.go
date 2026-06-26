@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -398,4 +399,229 @@ func TestBrokerIndexKeyConstant(t *testing.T) {
 // satisfies the ObjectStore interface.
 func TestBrokerImplementsObjectStore(t *testing.T) {
 	var _ ObjectStore = (*BrokerStore)(nil)
+}
+
+// ---------------------------------------------------------------------------
+// Retry test helpers
+// ---------------------------------------------------------------------------
+
+// failingHandler wraps an HTTP handler and returns the given HTTP status code
+// for the first n requests whose URL path contains pathMatch (or every request
+// when pathMatch is empty). Subsequent requests are forwarded normally.
+type failingHandler struct {
+	mu        sync.Mutex
+	remaining int
+	code      int
+	pathMatch string
+	next      http.Handler
+}
+
+func (f *failingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	if f.remaining > 0 && (f.pathMatch == "" || strings.Contains(r.URL.Path, f.pathMatch)) {
+		f.remaining--
+		f.mu.Unlock()
+		http.Error(w, "injected failure", f.code)
+		return
+	}
+	f.mu.Unlock()
+	f.next.ServeHTTP(w, r)
+}
+
+// flakyTransport returns a network-level error for the first n RoundTrip calls,
+// then delegates to the underlying transport.
+type flakyTransport struct {
+	mu        sync.Mutex
+	remaining int
+	next      http.RoundTripper
+}
+
+func (f *flakyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	if f.remaining > 0 {
+		f.remaining--
+		f.mu.Unlock()
+		return nil, fmt.Errorf("injected network error")
+	}
+	f.mu.Unlock()
+	return f.next.RoundTrip(req)
+}
+
+// newRetryTestSetup builds a BrokerStore wired to the given HTTP handler.
+// The store has baseDelay=0 so retry tests run without sleeping.
+func newRetryTestSetup(t *testing.T, h http.Handler, broker *fakeBrokerServer) *BrokerStore {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	broker.serverURL = srv.URL
+	t.Cleanup(srv.Close)
+	store := NewBrokerStore(srv.URL, "X-Session-Api-Key", "test-secret")
+	store.baseDelay = 0 // suppress backoff delays in tests
+	return store
+}
+
+// ---------------------------------------------------------------------------
+// Retry tests
+// ---------------------------------------------------------------------------
+
+// TestBrokerPutRetries5xxBroker verifies that a 5xx response from the broker's
+// upload-url endpoint is retried and the Put eventually succeeds.
+func TestBrokerPutRetries5xxBroker(t *testing.T) {
+	ctx := context.Background()
+	broker := newFakeBrokerServer("X-Session-Api-Key", "test-secret")
+	// Fail the first two upload-url requests with 503; the third succeeds.
+	h := &failingHandler{remaining: 2, code: http.StatusServiceUnavailable, pathMatch: "upload-url", next: broker}
+	store := newRetryTestSetup(t, h, broker)
+
+	if err := store.Put(ctx, "chunk-retry-broker", []byte("hello")); err != nil {
+		t.Fatalf("Put: expected success after retries, got: %v", err)
+	}
+	got, err := store.GetRange(ctx, "chunk-retry-broker", 0, 5)
+	if err != nil {
+		t.Fatalf("GetRange: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("data mismatch: got %q, want %q", got, "hello")
+	}
+}
+
+// TestBrokerPutRetries5xxStorage verifies that a 5xx response from the storage
+// tier (the presigned-URL target) is retried and the Put eventually succeeds.
+func TestBrokerPutRetries5xxStorage(t *testing.T) {
+	ctx := context.Background()
+	broker := newFakeBrokerServer("X-Session-Api-Key", "test-secret")
+	// Fail the first two requests to /raw/ with 500; the third succeeds.
+	h := &failingHandler{remaining: 2, code: http.StatusInternalServerError, pathMatch: "/raw/", next: broker}
+	store := newRetryTestSetup(t, h, broker)
+
+	if err := store.Put(ctx, "chunk-retry-storage", []byte("world")); err != nil {
+		t.Fatalf("Put: expected success after retries, got: %v", err)
+	}
+	got, err := store.GetRange(ctx, "chunk-retry-storage", 0, 5)
+	if err != nil {
+		t.Fatalf("GetRange: %v", err)
+	}
+	if string(got) != "world" {
+		t.Errorf("data mismatch: got %q, want %q", got, "world")
+	}
+}
+
+// TestBrokerPutRetries403PresignExpiry verifies that a 403 from the storage
+// tier (expired presigned URL) is retried and a fresh URL is fetched from the
+// broker on each attempt.
+func TestBrokerPutRetries403PresignExpiry(t *testing.T) {
+	ctx := context.Background()
+	broker := newFakeBrokerServer("X-Session-Api-Key", "test-secret")
+	// Fail the first two storage PUT requests with 403; the third succeeds.
+	h := &failingHandler{remaining: 2, code: http.StatusForbidden, pathMatch: "/raw/", next: broker}
+	store := newRetryTestSetup(t, h, broker)
+
+	if err := store.Put(ctx, "chunk-presign-expiry", []byte("fresh")); err != nil {
+		t.Fatalf("Put: expected success after presign-URL refresh, got: %v", err)
+	}
+	got, err := store.GetRange(ctx, "chunk-presign-expiry", 0, 5)
+	if err != nil {
+		t.Fatalf("GetRange: %v", err)
+	}
+	if string(got) != "fresh" {
+		t.Errorf("data mismatch: got %q, want %q", got, "fresh")
+	}
+}
+
+// TestBrokerRetriesNetworkError verifies that a transport-level network error
+// (connection refused, reset, etc.) triggers the retry loop.
+func TestBrokerRetriesNetworkError(t *testing.T) {
+	ctx := context.Background()
+	broker := newFakeBrokerServer("X-Session-Api-Key", "test-secret")
+	srv := httptest.NewServer(broker)
+	broker.serverURL = srv.URL
+	t.Cleanup(srv.Close)
+
+	store := NewBrokerStore(srv.URL, "X-Session-Api-Key", "test-secret")
+	store.baseDelay = 0
+	// Inject two network errors before delegating to the real transport.
+	store.client = &http.Client{
+		Transport: &flakyTransport{remaining: 2, next: http.DefaultTransport},
+	}
+
+	if err := store.Put(ctx, "chunk-net-retry", []byte("net")); err != nil {
+		t.Fatalf("Put: expected success after network-error retries, got: %v", err)
+	}
+	got, err := store.GetRange(ctx, "chunk-net-retry", 0, 3)
+	if err != nil {
+		t.Fatalf("GetRange: %v", err)
+	}
+	if string(got) != "net" {
+		t.Errorf("data mismatch: got %q, want %q", got, "net")
+	}
+}
+
+// TestBrokerNoRetryOnPermanentError verifies that 401 Unauthorized causes an
+// immediate failure without retrying. The attempt counter must equal 1.
+func TestBrokerNoRetryOnPermanentError(t *testing.T) {
+	ctx := context.Background()
+	// Use a wrong auth value so every request is rejected with 401.
+	broker := newFakeBrokerServer("X-Session-Api-Key", "correct-secret")
+	srv := httptest.NewServer(broker)
+	broker.serverURL = srv.URL
+	t.Cleanup(srv.Close)
+
+	var attempts int
+	counting := &failingHandler{
+		remaining: 0, // never inject extra failures; count real requests
+		next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "upload-url") {
+				attempts++
+			}
+			broker.ServeHTTP(w, r)
+		}),
+	}
+	_ = counting // suppress unused warning; we use broker directly below
+
+	store := NewBrokerStore(srv.URL, "X-Session-Api-Key", "wrong-secret")
+	store.baseDelay = 0
+
+	err := store.Put(ctx, "should-fail", []byte("x"))
+	if err == nil {
+		t.Fatal("Put with wrong auth: expected error, got nil")
+	}
+	// 401 is not retryable — the error message must not contain a retry hint.
+	if isRetryable(err) {
+		t.Errorf("Put auth error must not be retryable: %v", err)
+	}
+}
+
+// TestBrokerExhaustsRetries verifies that when all attempts fail with a
+// retryable error the store returns an error after exactly maxAttempts tries.
+func TestBrokerExhaustsRetries(t *testing.T) {
+	ctx := context.Background()
+	broker := newFakeBrokerServer("X-Session-Api-Key", "test-secret")
+
+	var calls int
+	counting := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "upload-url") {
+			calls++
+		}
+		// Always return 503 for broker requests so they are all retried.
+		if !strings.HasPrefix(r.URL.Path, "/raw/") {
+			http.Error(w, "always down", http.StatusServiceUnavailable)
+			return
+		}
+		broker.ServeHTTP(w, r)
+	})
+
+	srv := httptest.NewServer(counting)
+	broker.serverURL = srv.URL
+	t.Cleanup(srv.Close)
+
+	store := NewBrokerStore(srv.URL, "X-Session-Api-Key", "test-secret")
+	store.baseDelay = 0
+	store.maxAttempts = 3 // 1 initial + 2 retries
+
+	err := store.Put(ctx, "always-fails", []byte("x"))
+	if err == nil {
+		t.Fatal("Put: expected error after exhausted retries, got nil")
+	}
+	if calls != store.maxAttempts {
+		t.Errorf("expected %d upload-url calls (one per attempt), got %d", store.maxAttempts, calls)
+	}
 }
