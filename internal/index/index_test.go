@@ -1,7 +1,9 @@
 package index
 
 import (
+	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -118,6 +120,16 @@ func checkInvariants(t *testing.T, idx *Index) {
 		if inode.Blksize != idx.blockSize {
 			t.Errorf("invariant blksizeConsistency: inode %d Blksize=%d, want %d",
 				ino, inode.Blksize, idx.blockSize)
+		}
+	}
+
+	// noOrphanedInodes: every inode in the map must have at least one
+	// directory reference (nlink >= 1). An nlink=0 inode has no directory
+	// entry and is unreachable — a leaked orphan from a failed two-phase
+	// create (CreateInode succeeded, AddDirEntry failed).
+	for ino, inode := range idx.inodes {
+		if inode.Nlink == 0 {
+			t.Errorf("invariant noOrphanedInodes: inode %d has nlink=0 (unreachable orphan)", ino)
 		}
 	}
 }
@@ -571,4 +583,148 @@ func TestReaddir(t *testing.T) {
 			t.Errorf("Readdir missing %q", name)
 		}
 	}
+}
+
+// --- Atomic make-node tests ---
+
+func TestMakeFile(t *testing.T) {
+	idx := New(4096)
+	n := now()
+
+	ino, err := idx.MakeFile(RootIno, "hello.txt", 0o644, 1000, 1000, 0, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkInvariants(t, idx)
+
+	inode, ok := idx.GetInode(ino)
+	if !ok {
+		t.Fatal("inode not found")
+	}
+	if inode.FileType != Regular {
+		t.Errorf("FileType: got %v, want Regular", inode.FileType)
+	}
+	if inode.Nlink != 1 {
+		t.Errorf("Nlink: got %d, want 1", inode.Nlink)
+	}
+	got, ok := idx.Lookup(RootIno, "hello.txt")
+	if !ok || got != ino {
+		t.Errorf("Lookup: got %d, %v; want %d, true", got, ok, ino)
+	}
+
+	// Duplicate name returns ErrExist.
+	_, err = idx.MakeFile(RootIno, "hello.txt", 0o644, 0, 0, 0, n)
+	if !errors.Is(err, ErrExist) {
+		t.Errorf("duplicate MakeFile: got %v, want ErrExist", err)
+	}
+	checkInvariants(t, idx)
+}
+
+func TestMakeDir(t *testing.T) {
+	idx := New(4096)
+	n := now()
+
+	ino, err := idx.MakeDir(RootIno, "subdir", 0o755, 0, 0, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkInvariants(t, idx)
+
+	inode, ok := idx.GetInode(ino)
+	if !ok {
+		t.Fatal("inode not found")
+	}
+	if inode.FileType != Directory {
+		t.Errorf("FileType: got %v, want Directory", inode.FileType)
+	}
+	// nlink=2: one for parent entry, one for "." self-link.
+	if inode.Nlink != 2 {
+		t.Errorf("Nlink: got %d, want 2", inode.Nlink)
+	}
+
+	// Duplicate name returns ErrExist.
+	_, err = idx.MakeDir(RootIno, "subdir", 0o755, 0, 0, n)
+	if !errors.Is(err, ErrExist) {
+		t.Errorf("duplicate MakeDir: got %v, want ErrExist", err)
+	}
+	checkInvariants(t, idx)
+}
+
+func TestMakeSymlink(t *testing.T) {
+	idx := New(4096)
+	n := now()
+
+	ino, err := idx.MakeSymlink(RootIno, "link", "/target/path", 0, 0, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkInvariants(t, idx)
+
+	inode, ok := idx.GetInode(ino)
+	if !ok {
+		t.Fatal("inode not found")
+	}
+	if inode.FileType != Symlink {
+		t.Errorf("FileType: got %v, want Symlink", inode.FileType)
+	}
+	if inode.Nlink != 1 {
+		t.Errorf("Nlink: got %d, want 1", inode.Nlink)
+	}
+	if inode.Size != int64(len("/target/path")) {
+		t.Errorf("Size: got %d, want %d", inode.Size, len("/target/path"))
+	}
+	target, ok := idx.GetSymlink(ino)
+	if !ok || target != "/target/path" {
+		t.Errorf("GetSymlink: got %q, %v", target, ok)
+	}
+
+	// Duplicate name returns ErrExist.
+	_, err = idx.MakeSymlink(RootIno, "link", "/other", 0, 0, n)
+	if !errors.Is(err, ErrExist) {
+		t.Errorf("duplicate MakeSymlink: got %v, want ErrExist", err)
+	}
+	checkInvariants(t, idx)
+}
+
+// TestConcurrentMakeFile verifies that concurrent attempts to create the same
+// file name leave no orphaned inodes in the index. Prior to the fix this test
+// would fail the noOrphanedInodes invariant because the losing goroutines each
+// succeeded at CreateInode (allocating an inode with nlink=0) before failing
+// at AddDirEntry, leaving unreachable inodes in the map.
+func TestConcurrentMakeFile(t *testing.T) {
+	const workers = 50
+	idx := New(4096)
+	n := now()
+
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		successes int
+		errs      []error
+	)
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			_, err := idx.MakeFile(RootIno, "contested.txt", 0o644, 0, 0, 0, n)
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				successes++
+			} else {
+				errs = append(errs, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successes != 1 {
+		t.Errorf("expected exactly 1 successful create, got %d", successes)
+	}
+	for _, err := range errs {
+		if !errors.Is(err, ErrExist) {
+			t.Errorf("expected ErrExist from losing goroutine, got: %v", err)
+		}
+	}
+	checkInvariants(t, idx)
 }

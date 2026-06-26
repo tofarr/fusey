@@ -12,6 +12,10 @@ import (
 
 const RootIno uint64 = 1
 
+// ErrExist is returned by the atomic make-node operations when the target name
+// already exists in the parent directory.
+var ErrExist = fmt.Errorf("entry already exists")
+
 // Index is the in-memory filesystem index. All public methods are safe for
 // concurrent use. The index tracks whether it is dirty relative to its last
 // on-disk snapshot (see persist.go).
@@ -318,6 +322,134 @@ func (idx *Index) AddDirEntry(parentIno uint64, name string, childIno uint64, no
 	idx.dirty = true
 	idx.remoteDirty = true
 	return nil
+}
+
+// MakeFile atomically allocates a new regular-file inode, links it into
+// parentIno under name, and returns its inode number. It returns ErrExist if
+// name is already present in the parent directory.
+//
+// Using this instead of separate CreateInode + AddDirEntry calls eliminates the
+// window in which a goroutine could observe a newly allocated inode with nlink=0
+// that has no directory entry — an orphan that would persist in the index
+// indefinitely if AddDirEntry subsequently failed (e.g. due to a concurrent
+// create of the same name).
+func (idx *Index) MakeFile(parentIno uint64, name string, mode, uid, gid, rdev uint32, now int64) (uint64, error) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	parent, ok := idx.inodes[parentIno]
+	if !ok {
+		return 0, fmt.Errorf("parent inode %d not found", parentIno)
+	}
+	if parent.FileType != Directory {
+		return 0, fmt.Errorf("inode %d is not a directory", parentIno)
+	}
+	if _, exists := idx.dirIndex[parentIno][name]; exists {
+		return 0, ErrExist
+	}
+
+	ino := idx.nextIno
+	idx.nextIno++
+	idx.inodes[ino] = &Inode{
+		Ino:      ino,
+		FileType: Regular,
+		Mode:     mode,
+		Nlink:    1,
+		UID:      uid,
+		GID:      gid,
+		Blksize:  idx.blockSize,
+		Atime:    now,
+		Mtime:    now,
+		Ctime:    now,
+		Rdev:     rdev,
+	}
+	idx.extents[ino] = []Extent{}
+	idx.dirIndex[parentIno][name] = ino
+	parent.Mtime = now
+	parent.Ctime = now
+	idx.dirty = true
+	return ino, nil
+}
+
+// MakeDir atomically allocates a new directory inode and links it into
+// parentIno under name. It returns ErrExist if name already exists.
+func (idx *Index) MakeDir(parentIno uint64, name string, mode, uid, gid uint32, now int64) (uint64, error) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	parent, ok := idx.inodes[parentIno]
+	if !ok {
+		return 0, fmt.Errorf("parent inode %d not found", parentIno)
+	}
+	if parent.FileType != Directory {
+		return 0, fmt.Errorf("inode %d is not a directory", parentIno)
+	}
+	if _, exists := idx.dirIndex[parentIno][name]; exists {
+		return 0, ErrExist
+	}
+
+	ino := idx.nextIno
+	idx.nextIno++
+	// Nlink=2: one for the parent directory entry, one for the "." self-link.
+	idx.inodes[ino] = &Inode{
+		Ino:      ino,
+		FileType: Directory,
+		Mode:     mode,
+		Nlink:    2,
+		UID:      uid,
+		GID:      gid,
+		Blksize:  idx.blockSize,
+		Atime:    now,
+		Mtime:    now,
+		Ctime:    now,
+	}
+	idx.dirIndex[ino] = map[string]uint64{}
+	idx.dirIndex[parentIno][name] = ino
+	parent.Mtime = now
+	parent.Ctime = now
+	idx.dirty = true
+	return ino, nil
+}
+
+// MakeSymlink atomically allocates a new symlink inode pointing at target and
+// links it into parentIno under name. It returns ErrExist if name already
+// exists.
+func (idx *Index) MakeSymlink(parentIno uint64, name, target string, uid, gid uint32, now int64) (uint64, error) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	parent, ok := idx.inodes[parentIno]
+	if !ok {
+		return 0, fmt.Errorf("parent inode %d not found", parentIno)
+	}
+	if parent.FileType != Directory {
+		return 0, fmt.Errorf("inode %d is not a directory", parentIno)
+	}
+	if _, exists := idx.dirIndex[parentIno][name]; exists {
+		return 0, ErrExist
+	}
+
+	ino := idx.nextIno
+	idx.nextIno++
+	idx.inodes[ino] = &Inode{
+		Ino:      ino,
+		FileType: Symlink,
+		Mode:     0o777,
+		Nlink:    1,
+		UID:      uid,
+		GID:      gid,
+		Blksize:  idx.blockSize,
+		Atime:    now,
+		Mtime:    now,
+		Ctime:    now,
+		Size:     int64(len(target)),
+	}
+	idx.symlinks[ino] = target
+	idx.dirIndex[parentIno][name] = ino
+	parent.Mtime = now
+	parent.Ctime = now
+	idx.dirty = true
+	return ino, nil
 }
 
 // RemoveDirEntry removes (parentIno, name), decrements the child's nlink, and
