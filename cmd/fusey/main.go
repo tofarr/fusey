@@ -156,7 +156,7 @@ func runDaemon(daemonID, mountpoint string) {
 
 	objStore, cs := mustBuildStore(ctx, cfg)
 	idx := loadIndex(ctx, cfg, objStore)
-	persistFn := buildPersistFn(ctx, cfg, idx, cs, objStore)
+	persistFn := buildPersistFn(cfg, idx, cs, objStore)
 
 	f := fusefs.New(idx, cs, cfg.MaxFSSize, cfg.CacheDir)
 	server, err := gofs.Mount(mountpoint, f.Root(), &gofs.Options{
@@ -182,14 +182,19 @@ func runDaemon(daemonID, mountpoint string) {
 	_, _ = fmt.Fprint(readyPipe, "ready\n")
 	readyPipe.Close()
 
-	// Periodic index persistence.
+	// Periodic index persistence — exits cleanly when ctx is cancelled.
 	go func() {
 		ticker := time.NewTicker(cfg.PersistInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			if idx.IsDirty() || idx.IsRemoteDirty() {
-				if err := persistFn(); err != nil {
-					log.Printf("persist index: %v", err)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if idx.IsDirty() || idx.IsRemoteDirty() {
+					if err := persistFn(ctx); err != nil {
+						log.Printf("persist index: %v", err)
+					}
 				}
 			}
 		}
@@ -198,13 +203,18 @@ func runDaemon(daemonID, mountpoint string) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	cancel()
+	cancel() // stop the periodic persist goroutine
 
 	log.Println("unmounting...")
 	if err := server.Unmount(); err != nil {
 		log.Printf("unmount: %v", err)
 	}
-	if err := persistFn(); err != nil {
+	// Use a fresh context for the final flush: the daemon's context was just
+	// cancelled to stop the background goroutine, and using it here would cause
+	// all S3/broker calls to fail immediately before any data is written.
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer flushCancel()
+	if err := persistFn(flushCtx); err != nil {
 		log.Printf("final persist: %v", err)
 	}
 	_ = os.Remove(pidPath)
@@ -267,7 +277,7 @@ func runCompact() {
 	objStore, cs := mustBuildStore(ctx, cfg)
 	idx := loadIndex(ctx, cfg, objStore)
 
-	persistFn := buildPersistFn(ctx, cfg, idx, cs, objStore)
+	persistFn := buildPersistFn(cfg, idx, cs, objStore)
 	comp := compaction.New(idx, cs, persistFn, cfg.CompactionThreshold, cfg.ChunkSize)
 
 	log.Println("starting compaction cycle")
@@ -326,7 +336,9 @@ func mustBuildStore(ctx context.Context, cfg *config.Config) (chunks.ObjectStore
 }
 
 // buildPersistFn returns a function that persists the index locally and then
-// to the remote object store.
+// to the remote object store. The returned function accepts a context so that
+// callers can supply different contexts for background periodic flushes versus
+// the final shutdown flush (which must use a fresh, non-cancelled context).
 //
 // Ordering rationale:
 //  1. index.Save (local disk) — runs when the in-memory index has diverged
@@ -340,8 +352,8 @@ func mustBuildStore(ctx context.Context, cfg *config.Config) (chunks.ObjectStore
 //     structural mutations since the last remote write (idx.IsRemoteDirty()).
 //     Atime-only updates from reads do not set the remote-dirty flag, so pure
 //     read workloads generate no presigned-URL round-trips.
-func buildPersistFn(ctx context.Context, cfg *config.Config, idx *index.Index, cs *chunks.ChunkStore, store chunks.ObjectStore) func() error {
-	return func() error {
+func buildPersistFn(cfg *config.Config, idx *index.Index, cs *chunks.ChunkStore, store chunks.ObjectStore) func(context.Context) error {
+	return func(ctx context.Context) error {
 		if idx.IsDirty() {
 			if err := index.Save(idx, cfg.CacheDir); err != nil {
 				return err

@@ -21,7 +21,7 @@ func setup(t *testing.T) (*index.Index, *chunks.ChunkStore, *Compactor) {
 	}
 	idx := index.New(4096)
 	cs := chunks.NewChunkStore(local, testChunkSize)
-	comp := New(idx, cs, func() error { return nil }, 0.3, testChunkSize)
+	comp := New(idx, cs, func(context.Context) error { return nil }, 0.3, testChunkSize)
 	return idx, cs, comp
 }
 
@@ -196,7 +196,7 @@ func TestCompactMultipleOutputChunks(t *testing.T) {
 
 	sealedBefore, _ = cs.ListSealed(ctx)
 
-	comp := New(idx, cs, func() error { return nil }, 0.3, tiny)
+	comp := New(idx, cs, func(context.Context) error { return nil }, 0.3, tiny)
 	if err := comp.Compact(ctx); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}

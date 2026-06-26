@@ -24,8 +24,10 @@ import (
 )
 
 // Persist is a function that durably persists the index.
+// The context governs the remote I/O; callers should pass a context that is
+// not already cancelled so the persist can actually complete.
 // Supplied by the caller so the compactor is independent of storage paths.
-type Persist func() error
+type Persist func(context.Context) error
 
 // Compactor selects orphan-heavy sealed chunks, copies their live extents into
 // new compacted chunks no larger than chunkSize, remaps the index, and deletes
@@ -148,7 +150,7 @@ func (c *Compactor) Compact(ctx context.Context) error {
 	// 6. CRITICAL: persist the index BEFORE deleting old chunks.
 	//    If we crash here, old chunks still exist and the index already points
 	//    at the new locations — duplicate data cleaned up on the next run.
-	if err := c.persist(); err != nil {
+	if err := c.persist(ctx); err != nil {
 		return fmt.Errorf("persist index before chunk deletion: %w", err)
 	}
 

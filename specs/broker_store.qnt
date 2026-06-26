@@ -42,18 +42,30 @@ module broker_store {
   // List() must never return this ID so the compactor ignores it.
   const INDEX_KEY: str
 
+  // Maximum number of HTTP attempts per operation (1 initial + N-1 retries).
+  // Corresponds to BrokerStore.maxAttempts in the Go implementation.
+  const MAX_ATTEMPTS: int
+
   // -------------------------------------------------------------------------
   // Types
   // -------------------------------------------------------------------------
 
   // HTTP status codes used in responses.
+  //
+  // Retryable vs permanent:
+  //   S403 — presigned-URL expiry on the storage tier; retrying the whole
+  //           operation re-fetches a fresh URL from the broker.
+  //   S500 — any 5xx from the broker or storage tier; transient server error.
+  //   S401, S404 — permanent failures; the client must not retry.
   type StatusCode =
     | S200  // OK
     | S201  // Created
     | S204  // No Content
     | S206  // Partial Content (range response)
-    | S401  // Unauthorized
-    | S404  // Not Found
+    | S401  // Unauthorized — permanent; wrong or missing auth token
+    | S403  // Forbidden — presigned-URL expired on storage tier (retryable)
+    | S404  // Not Found — permanent; object does not exist
+    | S500  // Internal Server Error — any 5xx from broker or storage (retryable)
 
   // A broker response carries a status code and, for data responses, a size.
   type BrokerResponse = {
@@ -84,6 +96,14 @@ module broker_store {
   // The set of IDs visible to chunk-store callers (excludes INDEX_KEY).
   pure def chunkIDs: Set[str] =
     objects.keys().exclude(Set(INDEX_KEY))
+
+  // True iff the status code represents a transient condition that is safe to
+  // retry.  The BrokerStore retries on these before propagating an error.
+  //   S403 — presigned-URL expiry: retrying re-fetches a fresh URL.
+  //   S500 — any 5xx from broker or storage tier: transient server error.
+  // Permanent failures (S401, S404) are not retryable and propagate immediately.
+  pure def isRetryable(status: StatusCode): bool =
+    status == S403 or status == S500
 
   // -------------------------------------------------------------------------
   // Invariants
@@ -254,6 +274,28 @@ module broker_store {
   }
 
   // -------------------------------------------------------------------------
+  // putTransient — a single failed attempt that returns a retryable error.
+  //
+  // Models the case where the broker or storage tier returns S500 (5xx) or
+  // S403 (presigned-URL expiry).  The key property: a transient failure MUST
+  // NOT mutate objects state.  Each retry begins with the same store state as
+  // the original attempt, which is why operation-level retries are safe.
+  //
+  // This action can occur at most MAX_ATTEMPTS-1 times before the operation
+  // either succeeds (via put) or is abandoned.
+  // -------------------------------------------------------------------------
+
+  action putTransient(token: str, id: str, failStatus: StatusCode): BrokerResponse = {
+    require(isRetryable(failStatus))  // only retryable codes are modelled here
+    // The critical property: objects is unchanged by a transient failure.
+    // Each retry therefore begins with the same store state as the original
+    // attempt, which is why operation-level retries are safe and idempotent.
+    objects' = objects
+    pure val resp: BrokerResponse = { status: failStatus, size: 0 }
+    resp
+  }
+
+  // -------------------------------------------------------------------------
   // Temporal / safety properties
   // -------------------------------------------------------------------------
 
@@ -275,4 +317,11 @@ module broker_store {
   // INDEX_KEY is never in the chunk list regardless of whether it exists.
   temporal indexAlwaysExcluded =
     always(not(INDEX_KEY.in(chunkIDs)))
+
+  // The retryable/permanent classification is consistent: permanent error codes
+  // are never retryable, and the two transient codes (S403, S500) always are.
+  // This ensures the BrokerStore can route each error unambiguously.
+  invariant retryableClassificationConsistent =
+    not(isRetryable(S401)) and not(isRetryable(S404)) and
+    isRetryable(S403) and isRetryable(S500)
 }

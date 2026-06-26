@@ -17,6 +17,18 @@
 //   receives "ready\n" it exits 0.  If the pipe closes without that string
 //   the daemon failed and the parent exits non-zero.
 //
+// Shutdown protocol:
+//   On SIGTERM or SIGINT the daemon transitions through three phases:
+//     DaemonStopping  — signal received; background context cancelled;
+//                       FUSE server unmounting (no new kernel requests).
+//     DaemonFlushing  — FUSE unmounted; final index flush running under a
+//                       fresh context with a 60-second budget so the remote
+//                       write is not cancelled along with the background ctx.
+//     DaemonStopped   — flush complete; PID file removed; process exited.
+//   The two-phase split (DaemonFlushing vs DaemonStopped) is the fix for the
+//   bug where cancel() was called before persistFn(), causing every S3/broker
+//   call in the final flush to return context.Canceled immediately.
+//
 // Correspondence to Go implementation (cmd/fusey/main.go):
 //   ParentForking     → runMount before cmd.Start
 //   ParentWaiting     → runMount blocking on io.ReadAll(r)
@@ -24,8 +36,9 @@
 //   ParentFailed      → runMount after log.Fatalf; exits non-zero
 //   DaemonStarting    → runDaemon before gofs.Mount
 //   DaemonReady       → runDaemon after gofs.Mount and PID file written
-//   DaemonStopping    → runDaemon after signal received
-//   DaemonStopped     → runDaemon after server.Unmount and os.Remove(pidPath)
+//   DaemonStopping    → runDaemon after signal and cancel(); before Unmount
+//   DaemonFlushing    → runDaemon after server.Unmount(); before persistFn(flushCtx)
+//   DaemonStopped     → runDaemon after persistFn and os.Remove(pidPath)
 
 module mount {
 
@@ -42,8 +55,9 @@ module mount {
   type DaemonState =
     | DaemonStarting   // loading config, connecting to store, loading index
     | DaemonReady      // gofs.Mount succeeded; PID file written; serving FUSE
-    | DaemonStopping   // SIGTERM/SIGINT received; running unmount
-    | DaemonStopped    // unmount complete; PID file removed; process exited
+    | DaemonStopping   // SIGTERM/SIGINT received; background ctx cancelled; FUSE unmounting
+    | DaemonFlushing   // FUSE unmounted; flushing index with fresh context
+    | DaemonStopped    // index flushed; PID file removed; process exited
 
   // --------------------------------------------------------------------------
   // State
@@ -54,6 +68,7 @@ module mount {
   var pipeSignalled:  bool  // daemon has written "ready\n" and closed pipe
   var pidFileExists:  bool  // <daemonDir>/daemon.pid is on disk
   var fsAccessible:   bool  // FUSE filesystem is usable by other processes
+  var indexFlushed:   bool  // final index persist completed on this shutdown
 
   // --------------------------------------------------------------------------
   // Initialisation
@@ -65,6 +80,7 @@ module mount {
     pipeSignalled' = false
     pidFileExists' = false
     fsAccessible'  = false
+    indexFlushed'  = false
   }
 
   // --------------------------------------------------------------------------
@@ -115,8 +131,9 @@ module mount {
     parentState' = ParentFailed
   }
 
-  // A signal (SIGTERM or SIGINT) triggers daemon shutdown.
-  // Only possible while the daemon is serving (DaemonReady).
+  // A signal (SIGTERM or SIGINT) arrives while the daemon is serving.
+  // The daemon cancels its background context (stopping the periodic persist
+  // goroutine) and begins unmounting the FUSE server.
   action daemonReceivesSignal = {
     require(daemonState == DaemonReady)
     daemonState' = DaemonStopping
@@ -130,11 +147,22 @@ module mount {
     daemonState' = DaemonStopping
   }
 
-  // Daemon finishes unmounting and cleans up.
-  action daemonStops = {
+  // The FUSE server finishes unmounting. The kernel can no longer issue new
+  // VFS requests so fsAccessible becomes false. The daemon then creates a
+  // fresh context (not the cancelled background one) and begins the index flush.
+  action daemonUnmounts = {
     require(daemonState == DaemonStopping)
-    daemonState'  = DaemonStopped
+    daemonState'  = DaemonFlushing
     fsAccessible' = false
+  }
+
+  // The final index flush completes (active chunk + index written to remote
+  // store under the fresh flush context). The daemon removes the PID file
+  // and exits cleanly.
+  action daemonFlushes = {
+    require(daemonState == DaemonFlushing)
+    daemonState'   = DaemonStopped
+    indexFlushed'  = true
     pidFileExists' = false
   }
 
@@ -150,10 +178,12 @@ module mount {
   invariant fsAccessibleIffDaemonReady =
     fsAccessible iff daemonState == DaemonReady
 
-  // The PID file exists while the daemon is serving or shutting down so that
-  // `fusey unmount` can always find a ready daemon.
+  // The PID file exists while the daemon is serving, stopping, or flushing so
+  // that `fusey unmount` can always find a daemon that has not yet cleaned up.
   invariant pidFileExistsWhileReachable =
-    pidFileExists implies (daemonState == DaemonReady or daemonState == DaemonStopping)
+    pidFileExists implies (daemonState == DaemonReady or
+                           daemonState == DaemonStopping or
+                           daemonState == DaemonFlushing)
 
   // When the daemon has stopped the PID file is gone.
   invariant pidFileGoneWhenStopped =
@@ -162,6 +192,17 @@ module mount {
   // The filesystem is never accessible after the daemon has stopped.
   invariant fsInaccessibleWhenStopped =
     daemonState == DaemonStopped implies not(fsAccessible)
+
+  // The filesystem is not accessible while the daemon is flushing.
+  // (FUSE was unmounted before the flush began.)
+  invariant fsInaccessibleWhileFlushing =
+    daemonState == DaemonFlushing implies not(fsAccessible)
+
+  // The index is flushed before the daemon declares itself stopped.
+  // This is the key safety property that the flushCtx fix enforces:
+  // a cancelled context must never prevent the final remote write.
+  invariant indexFlushedOnStop =
+    daemonState == DaemonStopped implies indexFlushed
 
   // --------------------------------------------------------------------------
   // Temporal properties
@@ -172,9 +213,13 @@ module mount {
     always(parentState == ParentWaiting implies
       eventually(parentState == ParentDone or parentState == ParentFailed))
 
-  // A signalled daemon eventually stops.
+  // A daemon that is stopping eventually completes its flush and exits.
   temporal daemonEventuallyStops =
     always(daemonState == DaemonStopping implies eventually(daemonState == DaemonStopped))
+
+  // A daemon that is flushing eventually exits.
+  temporal daemonEventuallyExitsAfterFlush =
+    always(daemonState == DaemonFlushing implies eventually(daemonState == DaemonStopped))
 
   // Once the daemon is ready, it eventually receives a shutdown signal.
   temporal daemonEventuallyReceivesSignal =
