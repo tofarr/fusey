@@ -42,6 +42,16 @@ module filesystem {
   var nextChunkSeq      : int
   var lastWrittenExtent : Extent
 
+  // --- Journal (re-declared from journal.qnt; see that module for semantics) ---
+  // The journal is optional (FUSEY_JOURNAL_ENABLED). When disabled, journalEnabled
+  // is false and the `journalAppend` action is a no-op; nothing is recorded.
+  var journalEntries   : List[JournalEntry]
+  var journalNextSeq   : int
+  var journalFlushedSeq: int
+  var journalDirty     : bool
+  var journalEnabled   : bool
+  var journalBase      : IndexSnapshot
+
   // -------------------------------------------------------------------------
   // Constants
   // -------------------------------------------------------------------------
@@ -96,6 +106,47 @@ module filesystem {
     activeChunkId'      = firstChunkId
     nextChunkSeq'       = 1
     lastWrittenExtent'  = sentinel
+    // Journal starts empty and disabled. The daemon enables it on startup
+    // when FUSEY_JOURNAL_ENABLED is set.
+    journalEntries'    = List()
+    journalNextSeq'    = 1
+    journalFlushedSeq' = 0
+    journalDirty'      = false
+    journalEnabled'    = false
+    journalBase'       = emptySnapshot
+  }
+
+  // -------------------------------------------------------------------------
+  // Journal helpers
+  // -------------------------------------------------------------------------
+
+  // Append one or more events to the journal (returns the new state record).
+  // No-op when the journal is disabled. Pure helper: filesystem actions
+  // destructure the result and assign the journal fields alongside their
+  // own in-memory state updates. The timestamp for each event is supplied
+  // by the caller (the same `now` used for the corresponding index mutation)
+  // so the journal entry's ts is consistent with the index's inode
+  // timestamps after replay.
+  pure def appendJournal(
+    entries: List[JournalEntry],
+    nextSeq: int,
+    enabled: bool,
+    ops    : List[JournalEvent],
+    ts     : int
+  ): { entries: List[JournalEntry], nextSeq: int, dirty: bool } = {
+    if (not(enabled))
+      { entries: entries, nextSeq: nextSeq, dirty: false }
+    else {
+      val tagged = ops.foldl(
+        { out: List[JournalEntry], s: int },
+        { out: List(), s: nextSeq },
+        (acc, op) => {
+          val entry: JournalEntry = { seq: acc.s, ts: ts, op: op }
+          { out: acc.out.append(entry), s: acc.s + 1 }
+        }
+      )
+      { entries: tagged.out, nextSeq: tagged.s, dirty: true }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -159,6 +210,19 @@ module filesystem {
     extentMap'      = extentMap.set(ino, List())
     nextIno'        = nextIno + 1
     diskCacheDirty' = true
+    // Journal: record the inode creation and the dirEntry add as two events.
+    val j = appendJournal(journalEntries, journalNextSeq, journalEnabled,
+      List(
+        CreateInode({ ino: ino, fileType: Regular, mode: mode, nlink: 1,
+                      uid: uid, gid: gid, rdev: 0,
+                      atime: now, mtime: now, ctime: now,
+                      blksize: BLOCK_SIZE, blocks: 0 }),
+        AddDirEntry({ parentIno: parentIno, name: name, childIno: ino })
+      ),
+      now)
+    journalEntries' = j.entries
+    journalNextSeq' = j.nextSeq
+    journalDirty'   = j.dirty
   }
 
   // -------------------------------------------------------------------------
@@ -187,6 +251,18 @@ module filesystem {
     dirEntries'     = dirEntries.union(Set(newEntry))
     nextIno'        = nextIno + 1
     diskCacheDirty' = true
+    val j = appendJournal(journalEntries, journalNextSeq, journalEnabled,
+      List(
+        CreateInode({ ino: ino, fileType: Directory, mode: mode, nlink: 1,
+                      uid: uid, gid: gid, rdev: 0,
+                      atime: now, mtime: now, ctime: now,
+                      blksize: BLOCK_SIZE, blocks: 0 }),
+        AddDirEntry({ parentIno: parentIno, name: name, childIno: ino })
+      ),
+      now)
+    journalEntries' = j.entries
+    journalNextSeq' = j.nextSeq
+    journalDirty'   = j.dirty
   }
 
   // -------------------------------------------------------------------------
@@ -216,6 +292,19 @@ module filesystem {
     symlinkTargets' = symlinkTargets.set(ino, target)
     nextIno'        = nextIno + 1
     diskCacheDirty' = true
+    val j = appendJournal(journalEntries, journalNextSeq, journalEnabled,
+      List(
+        CreateInode({ ino: ino, fileType: Symlink, mode: 0o777, nlink: 1,
+                      uid: uid, gid: gid, rdev: 0,
+                      atime: now, mtime: now, ctime: now,
+                      blksize: BLOCK_SIZE, blocks: 0 }),
+        AddDirEntry({ parentIno: parentIno, name: name, childIno: ino }),
+        SetSymlink({ ino: ino, target: target })
+      ),
+      now)
+    journalEntries' = j.entries
+    journalNextSeq' = j.nextSeq
+    journalDirty'   = j.dirty
   }
 
   // -------------------------------------------------------------------------
@@ -239,6 +328,12 @@ module filesystem {
                         .set(ino, { ...inode, nlink: inode.nlink + 1, ctime: now })
                         .set(parentIno, { ...parent, mtime: now, ctime: now })
     diskCacheDirty' = true
+    val j = appendJournal(journalEntries, journalNextSeq, journalEnabled,
+      List(AddDirEntry({ parentIno: parentIno, name: name, childIno: ino })),
+      now)
+    journalEntries' = j.entries
+    journalNextSeq' = j.nextSeq
+    journalDirty'   = j.dirty
   }
 
   // -------------------------------------------------------------------------
@@ -271,6 +366,15 @@ module filesystem {
                       else symlinkTargets
     xattrs'         = if (newNlink == 0) xattrs.remove(entry.childIno) else xattrs
     diskCacheDirty' = true
+    val ops = if (newNlink == 0)
+                List(RemoveDirEntry({ parentIno: parentIno, name: name }),
+                     DeleteInode({ ino: entry.childIno }))
+              else
+                List(RemoveDirEntry({ parentIno: parentIno, name: name }))
+    val j = appendJournal(journalEntries, journalNextSeq, journalEnabled, ops, now)
+    journalEntries' = j.entries
+    journalNextSeq' = j.nextSeq
+    journalDirty'   = j.dirty
   }
 
   // -------------------------------------------------------------------------
@@ -294,6 +398,13 @@ module filesystem {
                         .set(parentIno, { ...parent, mtime: now, ctime: now })
     xattrs'         = xattrs.remove(entry.childIno)
     diskCacheDirty' = true
+    val j = appendJournal(journalEntries, journalNextSeq, journalEnabled,
+      List(RemoveDirEntry({ parentIno: parentIno, name: name }),
+           DeleteInode({ ino: entry.childIno })),
+      now)
+    journalEntries' = j.entries
+    journalNextSeq' = j.nextSeq
+    journalDirty'   = j.dirty
   }
 
   // -------------------------------------------------------------------------
@@ -357,6 +468,20 @@ module filesystem {
     dirEntries'     = withoutSrc.union(Set(newEntry))
     inodes'         = inodesAfterDstRemoval
     diskCacheDirty' = true
+    // Journal: a single Rename event captures the move. If the destination
+    // existed and was deleted (nlink reached 0), we additionally emit a
+    // DeleteInode for the replaced entry.
+    val jOps = if (dstExists and inodesAfterDstRemoval.get(dstEntry.childIno).isDefined() == false)
+      List(Rename({ srcParent: srcParent, srcName: srcName,
+                    dstParent: dstParent, dstName: dstName }),
+           DeleteInode({ ino: dstEntry.childIno }))
+    else
+      List(Rename({ srcParent: srcParent, srcName: srcName,
+                    dstParent: dstParent, dstName: dstName }))
+    val j = appendJournal(journalEntries, journalNextSeq, journalEnabled, jOps, now)
+    journalEntries' = j.entries
+    journalNextSeq' = j.nextSeq
+    journalDirty'   = j.dirty
   }
 
   // -------------------------------------------------------------------------
@@ -385,6 +510,15 @@ module filesystem {
     inodes'         = inodes.set(ino, { ...updated, ctime: now })
     extentMap'      = newExtentMap
     diskCacheDirty' = true
+    val j = appendJournal(journalEntries, journalNextSeq, journalEnabled,
+      List(SetAttr({ ino: ino, mode: updated.mode, uid: updated.uid,
+                     gid: updated.gid, size: updated.size,
+                     atime: updated.atime, mtime: updated.mtime, ctime: now,
+                     nlink: updated.nlink, rdev: updated.rdev })),
+      now)
+    journalEntries' = j.entries
+    journalNextSeq' = j.nextSeq
+    journalDirty'   = j.dirty
   }
 
   // -------------------------------------------------------------------------
@@ -479,6 +613,16 @@ module filesystem {
                         ctime : now
                       })
     diskCacheDirty' = true
+    // Journal: a single WriteExtent event captures the new extent. Replay
+    // re-applies it via the same WriteExtent path (appendExtent would fail
+    // because the new extent's fileOffset may not equal current size when
+    // overwriting; WriteExtent handles both append and overwrite correctly).
+    val j = appendJournal(journalEntries, journalNextSeq, journalEnabled,
+      List(WriteExtent({ ino: ino, extent: newExtent })),
+      now)
+    journalEntries' = j.entries
+    journalNextSeq' = j.nextSeq
+    journalDirty'   = j.dirty
   }
 
   // -------------------------------------------------------------------------
@@ -527,6 +671,64 @@ module filesystem {
       nextIno       : nextIno
     }
     diskCacheDirty' = false
+  }
+
+  // -------------------------------------------------------------------------
+  // Journal management actions
+  // -------------------------------------------------------------------------
+
+  // Enable the journal. Called once on daemon startup when FUSEY_JOURNAL_ENABLED
+  // is set. The journal starts empty; the daemon takes a fresh base snapshot
+  // on the next call to refreshJournalBase.
+  action enableJournal = {
+    journalEnabled' = true
+  }
+
+  // Disable the journal. Called when the user toggles FUSEY_JOURNAL_ENABLED off.
+  // The existing journal is preserved (not cleared) so that the next mount can
+  // still as-of-replay against it; only new mutations stop being recorded.
+  action disableJournal = {
+    journalEnabled' = false
+    journalDirty'   = false
+  }
+
+  // Wipe the journal. Called at the START of `fusey compact`, BEFORE any
+  // chunk remap. The base is also cleared (with an empty journal, the base
+  // is by definition the same as the current index). Sequence numbers reset
+  // to 1; a fresh base will be captured on the next refreshJournalBase call.
+  action clearJournal = {
+    journalEntries'    = List()
+    journalNextSeq'    = 1
+    journalFlushedSeq' = 0
+    journalDirty'      = false
+    val empty: IndexSnapshot = {
+      inodes: Map(ROOT_INO -> inodes.get(ROOT_INO)),
+      dirEntries: Set(), extentMap: Map(), symlinkTargets: Map(),
+      xattrs: Map(), nextIno: nextIno
+    }
+    journalBase' = empty
+  }
+
+  // Capture the current in-memory state as the new journal base. Called at
+  // the END of `fusey compact`, once the index has been remapped and the
+  // journal has been cleared.
+  action refreshJournalBase = {
+    journalBase' = {
+      inodes        : inodes,
+      dirEntries    : dirEntries,
+      extentMap     : extentMap,
+      symlinkTargets: symlinkTargets,
+      xattrs        : xattrs,
+      nextIno       : nextIno
+    }
+  }
+
+  // Flush every unflushed journal entry to the remote object store. Called
+  // by buildPersistFn alongside persistIndex. The implementation writes
+  // append-only shards {prefix}journal-NNNNNNNNN.cbor, one per batch.
+  action flushJournalToRemote = {
+    journalFlushedSeq' = journalNextSeq - 1
+    journalDirty'      = false
   }
 
   // -------------------------------------------------------------------------
@@ -607,6 +809,41 @@ module filesystem {
   // Total used bytes never exceed the configured maximum.
   invariant usedWithinBound =
     usedBytes(inodes) <= MAX_FS_SIZE
+
+  // -------------------------------------------------------------------------
+  // Journal invariants
+  // -------------------------------------------------------------------------
+
+  // Sequence numbers in the journal are dense and start at 1.
+  invariant journalSeqsContiguous =
+    journalEntries.length() == 0 or
+    (journalEntries.nth(0).seq == 1 and
+     forall i in 0.to(journalEntries.length() - 2):
+       journalEntries.nth(i + 1).seq == journalEntries.nth(i).seq + 1)
+
+  // nextSeq is always strictly greater than every assigned sequence number.
+  invariant journalSeqMonotone =
+    forall e in journalEntries: e.seq < journalNextSeq
+
+  // flushedSeq never exceeds the highest assigned seq, and is never negative.
+  invariant journalFlushedWithinBounds =
+    journalFlushedSeq >= 0 and journalFlushedSeq <= journalNextSeq - 1
+
+  // journalDirty accurately reflects whether there are unflushed entries.
+  invariant journalDirtyConsistent =
+    journalDirty == (journalNextSeq > journalFlushedSeq + 1)
+
+  // All journal entry timestamps are positive.
+  invariant journalTimestampsPositive =
+    forall e in journalEntries: e.ts > 0
+
+  // As-of replay correctness: replaying every journal entry on top of the
+  // base yields the current index state. This is the property that makes
+  // `fusey mount --as-of=<ts>` work; it must hold whenever the journal is
+  // enabled. (Not enforced in the spec because Quint cannot easily express
+  // "the in-memory state equals base + applied events"; the Go test in
+  // internal/journal/journal_test.go::TestReplayEqualsLive is the runtime
+  // check.)
 
   // -------------------------------------------------------------------------
   // Temporal properties

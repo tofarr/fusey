@@ -73,6 +73,17 @@ type Config struct {
 	CompactionThreshold float64
 	// PersistInterval is how often the index is flushed to disk and S3 (FUSEY_PERSIST_INTERVAL).
 	PersistInterval time.Duration
+
+	// --- Journal (optional edit log) ---
+
+	// JournalEnabled toggles the optional edit log. When true, every
+	// state-mutating operation on the index is also recorded to a sharded
+	// append-only log in the backing object store. This enables
+	// `fusey journal-dump` and `fusey mount <mp> --as-of=<ts>`.
+	// Default false; the journal is an optional extra that consumes extra
+	// storage and is wiped on every `fusey compact` cycle.
+	// (FUSEY_JOURNAL_ENABLED).
+	JournalEnabled bool
 }
 
 // Load reads FUSEY_* environment variables and returns a populated Config.
@@ -94,6 +105,7 @@ func Load() (*Config, error) {
 		BrokerAuthValue:     os.Getenv("FUSEY_BROKER_AUTH_VALUE"),
 		CompactionThreshold: DefaultCompactionThreshold,
 		PersistInterval:     DefaultPersistInterval,
+		JournalEnabled:      false,
 	}
 	if v := os.Getenv("FUSEY_BROKER_AUTH_HEADER"); v != "" {
 		cfg.BrokerAuthHeader = v
@@ -124,6 +136,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if err := parseDurationEnv("FUSEY_PERSIST_INTERVAL", &cfg.PersistInterval); err != nil {
+		return nil, err
+	}
+	if err := parseBoolEnv("FUSEY_JOURNAL_ENABLED", &cfg.JournalEnabled); err != nil {
 		return nil, err
 	}
 	return cfg, nil

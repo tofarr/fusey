@@ -207,6 +207,32 @@ func (s *S3Store) IndexKey() string {
 	return s.prefix + "index.cbor"
 }
 
+// Prefix returns the per-bucket key prefix.
+func (s *S3Store) Prefix() string { return s.prefix }
+
+// JournalKey returns the full S3 key (with prefix) for a journal shard.
+func (s *S3Store) JournalKey(seq uint64) string {
+	return s.prefix + JournalShardName(seq)
+}
+
+// DeleteJournalKey removes a journal shard by its full key. Returns nil
+// for objects that don't exist (idempotent). The journal package uses
+// this to clear the journal at the start of a `fusey compact` cycle.
+func (s *S3Store) DeleteJournalKey(ctx context.Context, key string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		// A not-found on delete is idempotent success.
+		if isS3NotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("delete object %q: %w", key, err)
+	}
+	return nil
+}
+
 // isS3NotFound reports whether err represents a missing object (HTTP 404 /
 // NoSuchKey). Covers both real AWS S3 and S3-compatible stores.
 func isS3NotFound(err error) bool {
