@@ -88,6 +88,22 @@ func runMount(mountpoint string) {
 		log.Fatalf("create daemon dir: %v", err)
 	}
 
+	// Capture the daemon's stderr (and therefore the stderr of any helper
+	// go-fuse execs during the FUSE mount, such as fusermount3) into a sidecar
+	// file. go-fuse v2.10.x inherits the parent's fd 2 for helper stderr and
+	// only surfaces a cryptic "exit code <raw-wait-status>" message of its own;
+	// the real kernel/syscall error from fusermount3 would otherwise be lost.
+	mountLogPath := filepath.Join(daemonDir, "mount.log")
+	mountLog, err := os.OpenFile(
+		mountLogPath,
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+		0644,
+	)
+	if err != nil {
+		log.Fatalf("open mount log: %v", err)
+	}
+	defer mountLog.Close()
+
 	r, w, err := os.Pipe()
 	if err != nil {
 		log.Fatalf("pipe: %v", err)
@@ -100,6 +116,7 @@ func runMount(mountpoint string) {
 	cmd := exec.Command(exe, "daemon", daemonID, mountpoint)
 	cmd.Env = os.Environ()
 	cmd.ExtraFiles = []*os.File{w} // becomes fd 3 in the daemon
+	cmd.Stderr = mountLog            // fd 2 in the daemon — inherited by go-fuse helpers
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("start daemon: %v", err)
@@ -109,7 +126,11 @@ func runMount(mountpoint string) {
 	buf, err := io.ReadAll(r)
 	r.Close()
 	if err != nil || string(buf) != "ready\n" {
-		log.Fatalf("daemon failed to mount; check %s", filepath.Join(daemonDir, "fusey.log"))
+		log.Fatalf(
+			"daemon failed to mount; check %s and %s",
+			filepath.Join(daemonDir, "fusey.log"),
+			mountLogPath,
+		)
 	}
 
 	fmt.Printf("fusey: mounted %s (daemon %s)\n", mountpoint, daemonID)
