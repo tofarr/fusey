@@ -48,10 +48,21 @@ func TestRunMountCapturesMountLog(t *testing.T) {
 	// (syscall.Stat returns ENOENT) or in the callFusermount fallback.
 	badMount := filepath.Join(cacheDir, "does-not-exist")
 
+	// mustLoadConfig requires either FUSEY_BROKER_URL or FUSEY_BUCKET. We
+	// point the broker at an unreachable port so the daemon subprocess fails
+	// fast (connection refused on the first request; ~1.5s with broker's
+	// 4-attempt exponential backoff) instead of hanging on a real-but-slow
+	// backend. The point of this test is the parent's failure path, not the
+	// daemon's storage round-trip.
+	const unreachableBroker = "http://127.0.0.1:1"
+
 	// Run the source, not the test binary. We invoke go run with the absolute
 	// package directory so this works regardless of working directory.
 	cmd := exec.Command("go", "run", cmdFuseyDir, "mount", badMount)
-	cmd.Env = append(os.Environ(), "FUSEY_CACHE_DIR="+cacheDir)
+	cmd.Env = append(os.Environ(),
+		"FUSEY_CACHE_DIR="+cacheDir,
+		"FUSEY_BROKER_URL="+unreachableBroker,
+	)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected fusey mount to fail; output:\n%s", out)
