@@ -39,6 +39,14 @@
 //   DaemonStopping    → runDaemon after signal and cancel(); before Unmount
 //   DaemonFlushing    → runDaemon after server.Unmount(); before persistFn(flushCtx)
 //   DaemonStopped     → runDaemon after persistFn and os.Remove(pidPath)
+//
+// Mount log:
+//   <daemonDir>/mount.log is opened by runMount and assigned as the daemon
+//   subprocess's stderr before cmd.Start. Anything the daemon — and any helper
+//   it execs (notably go-fuse's fusermount3 fallback) — writes to fd 2 ends
+//   up there. This is what makes the user's `fusey mount` failure diagnostic:
+//   instead of go-fuse's cryptic "fusermount exited with code 256" you also
+//   get the kernel syscall error (EPERM, EACCES, EBUSY, ...) in mount.log.
 
 module mount {
 
@@ -69,18 +77,22 @@ module mount {
   var pidFileExists:  bool  // <daemonDir>/daemon.pid is on disk
   var fsAccessible:   bool  // FUSE filesystem is usable by other processes
   var indexFlushed:   bool  // final index persist completed on this shutdown
+  var mountLogExists: bool  // <daemonDir>/mount.log has been opened by runMount
+                            // and (if the daemon ran) populated with the
+                            // daemon's stderr via the fd-2 inheritance trick
 
   // --------------------------------------------------------------------------
   // Initialisation
   // --------------------------------------------------------------------------
 
   action init = {
-    parentState'   = ParentForking
-    daemonState'   = DaemonStarting
-    pipeSignalled' = false
-    pidFileExists' = false
-    fsAccessible'  = false
-    indexFlushed'  = false
+    parentState'    = ParentForking
+    daemonState'    = DaemonStarting
+    pipeSignalled'  = false
+    pidFileExists'  = false
+    fsAccessible'   = false
+    indexFlushed'   = false
+    mountLogExists' = false
   }
 
   // --------------------------------------------------------------------------
@@ -88,9 +100,12 @@ module mount {
   // --------------------------------------------------------------------------
 
   // Parent finishes forking the daemon and starts waiting on the pipe.
+  // In runMount, the mount.log sidecar is opened before cmd.Start, so it
+  // exists on disk from the moment the parent is waiting for readiness.
   action parentStartsWaiting = {
     require(parentState == ParentForking)
-    parentState' = ParentWaiting
+    parentState'    = ParentWaiting
+    mountLogExists' = true
   }
 
   // Daemon successfully completes gofs.Mount.
@@ -173,6 +188,18 @@ module mount {
   // The parent only exits successfully when the daemon signalled readiness.
   invariant parentDoneImpliesSignalled =
     parentState == ParentDone implies pipeSignalled
+
+  // When the parent reports failure the mount log is on disk: this is the
+  // whole point of the sidecar fd-2 capture — it is the only place the user
+  // can read the kernel syscall error that caused the failure.
+  invariant parentFailedImpliesMountLog =
+    parentState == ParentFailed implies mountLogExists
+
+  // The mount log is created before the daemon is forked, so it exists
+  // throughout the waiting phase regardless of whether the daemon ultimately
+  // succeeds or fails.
+  invariant mountLogExistsWhileParentWaiting =
+    parentState == ParentWaiting implies mountLogExists
 
   // The filesystem is accessible only when the daemon is actively serving.
   invariant fsAccessibleIffDaemonReady =
