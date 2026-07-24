@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -14,28 +15,42 @@ import (
 // runMount has created <daemonDir>/mount.log before spawning the daemon and
 // the parent's failure message points at both fusey.log and mount.log.
 //
-// The test re-execs the test binary as `fusey mount <bad-mountpoint>` so that
-// the production runMount() runs end-to-end (no mocks). We use a non-existent
-// mountpoint to reliably fail gofs.Mount, and we skip entirely on systems
-// where /dev/fuse is not available, matching the pattern used by
-// internal/fuse/fs_test.go.
+// The test invokes `go run` on this package's source main() — NOT the test
+// binary. Re-execing the test binary via os.Executable() does not work: a
+// `go test` binary has its main() replaced by testing.Main(), so it would
+// run all tests (including this one) in the subprocess, causing infinite
+// recursion. Using `go run` on the source directory gives us a real fusey
+// binary whose main() dispatches to runMount based on os.Args[1].
+//
+// Skips when /dev/fuse is not available or when `go` is not in PATH,
+// matching the patterns used in internal/fuse/fs_test.go and the CI runner.
 func TestRunMountCapturesMountLog(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skipf("/dev/fuse not available: %v", err)
 	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("go not in PATH: %v", err)
+	}
 
 	cacheDir := t.TempDir()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
+
+	// The test file lives in cmd/fusey/, which is the package we want
+	// `go run` to compile. runtime.Caller(0) gives us this path reliably
+	// regardless of where the test is invoked from.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
 	}
+	cmdFuseyDir := filepath.Dir(thisFile)
 
 	// A mountpoint under our temp dir that does not exist (and is not created
 	// in any setup step). gofs.Mount will fail on it — either in mountDirect
 	// (syscall.Stat returns ENOENT) or in the callFusermount fallback.
 	badMount := filepath.Join(cacheDir, "does-not-exist")
 
-	cmd := exec.Command(exe, "mount", badMount)
+	// Run the source, not the test binary. We invoke go run with the absolute
+	// package directory so this works regardless of working directory.
+	cmd := exec.Command("go", "run", cmdFuseyDir, "mount", badMount)
 	cmd.Env = append(os.Environ(), "FUSEY_CACHE_DIR="+cacheDir)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
