@@ -1,6 +1,9 @@
 package index
 
-import "syscall"
+import (
+	"fmt"
+	"syscall"
+)
 
 // FileType corresponds to the FileType variant in types.qnt.
 // Values are the standard Linux file-type bits from the mode word.
@@ -39,6 +42,29 @@ type Inode struct {
 // FullMode returns the complete Linux mode word (file type bits | permission bits).
 func (n *Inode) FullMode() uint32 {
 	return uint32(n.FileType) | n.Mode
+}
+
+// String returns a human-readable name for the file type ("Regular",
+// "Directory", "Symlink", etc.). Used by the journal dump and by tests.
+func (t FileType) String() string {
+	switch t {
+	case Regular:
+		return "Regular"
+	case Directory:
+		return "Directory"
+	case Symlink:
+		return "Symlink"
+	case BlockDev:
+		return "BlockDev"
+	case CharDev:
+		return "CharDev"
+	case Fifo:
+		return "Fifo"
+	case Socket:
+		return "Socket"
+	default:
+		return fmt.Sprintf("FileType(%d)", uint32(t))
+	}
 }
 
 // Extent describes a contiguous run of a file's data within one chunk object.

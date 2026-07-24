@@ -111,4 +111,68 @@ module types {
     xattrs        : int -> (str -> str),
     nextIno       : int
   }
+
+  // -------------------------------------------------------------------------
+  // JournalEvent — a single recorded edit in the optional edit log.
+  //
+  // The journal is an append-only, sharded log of every state-mutating
+  // operation on the index (with the deliberate exception of TouchAtime:
+  // read access is too high-frequency and has no replay value).
+  //
+  // Each event carries a wall-clock nanosecond timestamp captured at the
+  // point of mutation.  Combined with the monotonic per-event sequence
+  // number assigned at append time, this supports both timestamp-based
+  // (--as-of=<ts>) and sequence-based replay.
+  //
+  // Delete operations are first-class events (DeleteInode, RemoveDirEntry,
+  // RemoveXattr) — the journal is not just an overwriting of the index file,
+  // it can record tombstones that the index snapshot cannot.
+  // -------------------------------------------------------------------------
+
+  type CreateInodeRec = {
+    ino     : int, fileType: FileType, mode: int, nlink: int,
+    uid     : int, gid: int, rdev: int,
+    atime   : int, mtime: int, ctime: int,
+    blksize : int, blocks: int
+  }
+
+  // SetAttrRec captures the full post-mutation Inode fields.  SetAttr covers
+  // chmod, chown, utimens, AND truncate (the size field changes are handled
+  // by the same SetAttr op in the index), so a single event type is enough.
+  // Replay re-applies the same SetAttr, which performs the same trim-or-grow
+  // logic the live index would have used.
+  type SetAttrRec = {
+    ino   : int, mode: int, uid: int, gid: int, size: int,
+    atime : int, mtime: int, ctime: int, nlink: int, rdev: int
+  }
+
+  type AddDirEntryRec    = { parentIno: int, name: str, childIno: int }
+  type RemoveDirEntryRec = { parentIno: int, name: str }
+  type RenameRec         = { srcParent: int, srcName: str, dstParent: int, dstName: str }
+  type WriteExtentRec    = { ino: int, extent: Extent }
+  type SetSymlinkRec     = { ino: int, target: str }
+  type SetXattrRec       = { ino: int, name: str, value: str }
+  type RemoveXattrRec    = { ino: int, name: str }
+  type DeleteInodeRec    = { ino: int }
+
+  type JournalEvent =
+    | CreateInode   (CreateInodeRec)
+    | DeleteInode   (DeleteInodeRec)
+    | AddDirEntry   (AddDirEntryRec)
+    | RemoveDirEntry(RemoveDirEntryRec)
+    | Rename        (RenameRec)
+    | SetAttr       (SetAttrRec)
+    | WriteExtent   (WriteExtentRec)
+    | SetSymlink    (SetSymlinkRec)
+    | SetXattr      (SetXattrRec)
+    | RemoveXattr   (RemoveXattrRec)
+
+  // A timestamped, sequenced journal entry as it lives in the log.
+  // seq is a per-daemon monotonically increasing counter assigned at append time.
+  // ts is the wall-clock time in nanoseconds since the Unix epoch.
+  type JournalEntry = {
+    seq: int,
+    ts : int,
+    op : JournalEvent
+  }
 }

@@ -407,3 +407,19 @@ func (s *BrokerStore) GetRaw(ctx context.Context, key string) ([]byte, error) {
 func (s *BrokerStore) IndexKey() string {
 	return brokerIndexKey
 }
+
+// Prefix returns the empty prefix for the broker: the broker has no
+// per-bucket key namespace, so the journal key is just the shard name.
+func (s *BrokerStore) Prefix() string { return "" }
+
+// JournalKey returns the broker object ID for a journal shard. The broker
+// namespace is flat, so the key is just the local shard name.
+func (s *BrokerStore) JournalKey(seq uint64) string {
+	return JournalShardName(seq)
+}
+
+// DeleteJournalKey removes a journal shard by its broker object ID.
+// Delegates to Delete (which is idempotent for missing objects).
+func (s *BrokerStore) DeleteJournalKey(ctx context.Context, key string) error {
+	return s.Delete(ctx, key)
+}

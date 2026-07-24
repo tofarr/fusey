@@ -136,6 +136,67 @@ spec:
           restartPolicy: OnFailure
 ```
 
+### Journal (optional edit log)
+
+Fusey can optionally record every state-mutating operation to an append-only
+edit log in the object store. This enables two additional features:
+
+- **`fusey journal-dump`** — a debug subcommand that prints every recorded
+  edit (with timestamp, sequence number, and full op fields) for auditing.
+- **`fusey mount <mp> --as-of=<ts>`** — a *read-only* mount of the filesystem
+  as it existed at wall-clock time `ts` (RFC 3339, with optional sub-second
+  precision). Useful for "what was the state at 10:00?" style queries and
+  for recovering from a bad write by `cp`-ing the historical state out.
+
+The journal is enabled by setting `FUSEY_JOURNAL_ENABLED=true` on the
+mount/daemon. When disabled, no journal entries are recorded and as-of
+mounts fail with a clear error.
+
+Design choices (set during design review, see `AGENTS.md`):
+
+- **TouchAtime is NOT journaled.** Read access is too high-frequency and
+  has no replay value. The journal only records writes (create, delete,
+  rename, setattr, write, truncate, xattr, symlink).
+- **Sharded, append-only.** Each flush writes a new shard named
+  `{prefix}journal-NNNNNNNNN.cbor` where N is the starting sequence
+  number of the batch. Existing shards are never overwritten — recovery
+  is the same shape as the chunk store's `RecoverNextSeq`.
+- **Wiped on compact.** `fusey compact` deletes the journal at the START
+  of its cycle, before any chunk remap. If compact crashes mid-cycle, the
+  next mount has an empty journal but the index and chunks are in a
+  consistent post-remap state; as-of mounts simply error during that
+  window. A fresh base snapshot is written at the end of compact so
+  subsequent as-of mounts can replay against the post-compact state.
+- **As-of mounts are read-only.** The FUSE mount is opened with `-o ro`,
+  so the kernel rejects all writes with `EROFS`. Recovery from a
+  historical state is `cp -a <as-of-mp>/path /live-mp/path` to copy
+  the desired files into a live mount.
+- **Storage cost.** The journal grows with write activity between
+  compactions. Operators who enable it should size their object store
+  budget accordingly (typical: < 1% of total data size for write-light
+  workloads; can dominate for write-heavy ones).
+
+Examples:
+
+```bash
+# Mount with the journal enabled (live mode)
+export FUSEY_JOURNAL_ENABLED=true
+./fusey mount /mnt/fusey
+
+# Inspect the journal
+./fusey journal-dump
+./fusey journal-dump --json | jq '.[].op.kind' | sort | uniq -c
+
+# Mount a historical snapshot read-only
+./fusey mount /mnt/fusey-asof --as-of=2026-01-15T10:00:00Z
+ls /mnt/fusey-asof/   # shows the state at that timestamp
+diff -r /mnt/fusey-asof/ /mnt/fusey/   # shows what changed since
+```
+
+The journal requires a base snapshot to be useful for as-of replay. The
+first time you mount with `FUSEY_JOURNAL_ENABLED=true`, the next run of
+`fusey compact` will write a base snapshot so as-of mounts work.
+
 ## Formal specification
 
 The `specs/` directory contains a [Quint](https://quint-lang.org/) formal
@@ -145,11 +206,12 @@ invariants and temporal properties of the design.
 
 | File | What it specifies |
 |---|---|
-| `specs/types.qnt` | Shared data types (Inode, Extent, DirEntry, Chunk, …) |
+| `specs/types.qnt` | Shared data types (Inode, Extent, DirEntry, Chunk, JournalEvent, …) |
 | `specs/index.qnt` | Index state machine: mutations, persistence, invariants |
 | `specs/chunks.qnt` | Chunk store: append, seal, rotate, read-range |
 | `specs/compaction.qnt` | Compaction: target selection, remap, commit, safety |
-| `specs/filesystem.qnt` | Full POSIX operations composing index + chunks |
+| `specs/journal.qnt` | Optional edit log: append, flush, clear, as-of replay |
+| `specs/filesystem.qnt` | Full POSIX operations composing index + chunks + journal |
 
 ### Running the specs
 
@@ -199,6 +261,7 @@ as a Kubernetes container without config files.
 | `FUSEY_PREFIX` | _(none)_ | Key prefix for all objects in the bucket (e.g. `pod-abc/`). Use this to share one bucket across multiple Fusey instances |
 | `FUSEY_COMPACTION_THRESHOLD` | `0.3` | Orphan fraction above which a chunk is targeted by `fusey compact` |
 | `FUSEY_PERSIST_INTERVAL` | `30s` | How often the index is flushed to disk and the object store |
+| `FUSEY_JOURNAL_ENABLED` | `false` | Set to `true` to record every state-mutating operation to the optional edit log. Required for `fusey journal-dump` and `fusey mount <mp> --as-of=<ts>`. |
 
 ### Broker store (alternative to direct S3)
 
@@ -220,6 +283,7 @@ A reference broker implementation is in [`broker/`](broker/). It stores objects 
 - [x] `statfs` support (`FUSEY_MAX_SIZE`)
 - [x] S3 chunk store backend (`aws-sdk-go-v2`, S3-compatible)
 - [x] Cold-start recovery (local cache → S3 → fresh)
+- [x] Optional edit log (`FUSEY_JOURNAL_ENABLED`) with as-of replay and `journal-dump`
 - [ ] Kubernetes deployment guide
 
 ## Development

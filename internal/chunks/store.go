@@ -4,7 +4,40 @@
 // (immutable). Reads are served as byte-range fetches from sealed chunks.
 package chunks
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"strings"
+)
+
+const JournalShardPrefix = "journal-"
+
+// JournalShardName returns the canonical local filename for a journal
+// shard starting at the given sequence number. Format: "journal-NNNNNNNNN"
+// with 9-digit zero-pad. Exposed here (rather than in the journal
+// package) so the broker and S3 store can construct keys without
+// importing journal — which would create a cycle, since journal imports
+// chunks to talk to ObjectStore.
+func JournalShardName(seq uint64) string {
+	return fmt.Sprintf("%s%09d", JournalShardPrefix, seq)
+}
+
+// ParseJournalShardName returns the starting seq for a journal shard
+// filename, or (0, false) if the name is not a recognised journal shard.
+func ParseJournalShardName(name string) (uint64, bool) {
+	if !strings.HasPrefix(name, JournalShardPrefix) {
+		return 0, false
+	}
+	rest := name[len(JournalShardPrefix):]
+	var seq uint64
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		seq = seq*10 + uint64(c-'0')
+	}
+	return seq, true
+}
 
 // Store is the abstract backing store for chunk objects.
 // Implementations include a local filesystem store (for testing), an S3
@@ -37,6 +70,9 @@ type ObjectStore interface {
 	Store
 
 	// PutRaw writes raw bytes to an arbitrary key (e.g. the index object).
+	// The key is the FULL key as it should appear in the underlying
+	// storage, including any prefix (use IndexKey / JournalKey rather
+	// than constructing a key by hand).
 	PutRaw(ctx context.Context, key string, data []byte) error
 
 	// GetRaw reads the full content of an arbitrary key.
@@ -45,4 +81,16 @@ type ObjectStore interface {
 
 	// IndexKey returns the key used to store the filesystem index snapshot.
 	IndexKey() string
+
+	// JournalKey returns the full key (including prefix) for a journal shard
+	// starting at the given sequence number. Used by the optional edit log.
+	JournalKey(seq uint64) string
+
+	// DeleteJournalKey removes a journal shard by full key. Used by
+	// `fusey compact` to wipe the journal at the start of a cycle.
+	DeleteJournalKey(ctx context.Context, key string) error
+
+	// Prefix returns the per-bucket key prefix. Used by the journal
+	// package to scope listing operations.
+	Prefix() string
 }

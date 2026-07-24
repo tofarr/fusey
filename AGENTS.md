@@ -17,18 +17,20 @@ Core design: log-structured storage (Haystack / Bitcask pattern) where:
 
 ```
 specs/              Quint formal specifications (written first, before Go)
-  types.qnt         Shared types: Inode, Extent, DirEntry, Chunk, IndexSnapshot
+  types.qnt         Shared types: Inode, Extent, DirEntry, Chunk, IndexSnapshot, JournalEvent
   index.qnt         Index state machine: mutations, persistence, invariants
   chunks.qnt        Chunk store: append, seal, rotate, readRange
   compaction.qnt    Compaction: target selection, remap, commit, safety proof
-  filesystem.qnt    Full POSIX operations composing index + chunks
-cmd/fusey/          Go binary entry point (to be implemented)
+  journal.qnt       Optional edit log: append, flush, clear, as-of replay
+  filesystem.qnt    Full POSIX operations composing index + chunks + journal
+cmd/fusey/          Go binary entry point (subcommands: mount, unmount, compact, journal-dump)
 internal/
   config/           Environment variable parsing (FUSEY_* vars)
   index/            In-memory index + disk persistence
   chunks/           Active chunk buffer + S3 sealed chunk I/O
   fuse/             FUSE layer (go-fuse bindings)
   compaction/       Background compactor goroutine
+  journal/          Optional edit log: in-memory buffer, sharded flusher, replay, dump
 ```
 
 ## Key design decisions
@@ -98,6 +100,9 @@ internal/
      used to share one bucket across multiple Fusey instances
    - `FUSEY_COMPACTION_THRESHOLD` (default 0.3) — orphan fraction trigger for `fusey compact`
    - `FUSEY_PERSIST_INTERVAL` (default 30s)
+   - `FUSEY_JOURNAL_ENABLED` (default false) — when true, every state-mutating
+     op is recorded to the optional edit log; required for `fusey journal-dump`
+     and `fusey mount <mp> --as-of=<ts>`
 
 10. **Invariants to preserve** (from specs, enforced in implementation):
     - `nlinkConsistency`: nlink == number of DirEntries pointing at inode (+1 for dirs)
@@ -112,6 +117,41 @@ internal/
     - Index must be persisted before old chunks are deleted
     - Recovering from crash-before-delete: old chunks still exist, re-deleting is idempotent
     - Recovering from crash-before-persist: replay from backing store index (not disk cache)
+
+12. **Journal (optional edit log)** — `FUSEY_JOURNAL_ENABLED`:
+    - When enabled, every state-mutating op on the index is also appended to
+      an in-memory journal buffer, which is flushed to the object store as
+      sharded append-only files `{prefix}journal-NNNNNNNNN.cbor` (one per
+      flush batch, named by the starting sequence number).
+    - TouchAtime is deliberately NOT journaled: high-frequency, no replay
+      value, matches the existing `remoteStoreDirty` exclusion in index.qnt.
+    - The journal supports two features: `fusey journal-dump` (a debug tool
+      that prints every recorded edit) and `fusey mount <mp> --as-of=<ts>`
+      (a read-only mount of the filesystem as it existed at wall-clock
+      time `ts`; errors if the journal is missing or the timestamp is
+      outside the recorded range).
+    - As-of mounts use `-o ro` on the underlying FUSE mount so the kernel
+      rejects all writes with EROFS. The Go FUSE layer additionally carries
+      a `readOnly` flag for explicit EROFS messages.
+    - The base snapshot is stored as `{prefix}index-base.cbor` (and
+      `<cacheDir>/index-base.cbor` locally). It is the state at the START
+      of the current journal period. As-of replay = base + journal entries
+      with `ts <= targetTs`.
+    - **`fusey compact` deletes the journal at the START of its cycle,**
+      before any chunk remap. If compact crashes mid-cycle, the next mount
+      has an empty journal but a consistent post-remap index+chunks; as-of
+      mounts simply error during that window. A fresh base snapshot is
+      written at the END of compact so subsequent as-of mounts have a
+      clean starting point.
+    - CLI shape: `fusey mount <mp> --as-of=<RFC3339-timestamp>` (flag AFTER
+      positional mountpoint). Sub-second precision is supported in
+      RFC3339Nano form. As-of mounts do not write a `daemon.pid`, so
+      `fusey unmount` does not see them — kill the parent `fusey mount`
+      process to stop one.
+    - Storage cost: grows with write activity between compactions. Typical
+      overhead is < 1% of total data size for write-light workloads; can
+      dominate for write-heavy ones. Operators who enable it should size
+      their object store budget accordingly.
 
 ## Quint spec notes
 

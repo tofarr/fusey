@@ -20,19 +20,57 @@ const (
 	entryTTL = 5 * time.Second
 )
 
+// FSIndex is the subset of *index.Index the FUSE layer needs. It is
+// satisfied by both *index.Index (when journal recording is disabled) and
+// *journal.JournaledIndex (when it is enabled). The FUSE layer holds an
+// FSIndex so the main wiring code can choose which implementation to
+// inject based on FUSEY_JOURNAL_ENABLED.
+type FSIndex interface {
+	GetInode(ino uint64) (index.Inode, bool)
+	Lookup(parentIno uint64, name string) (uint64, bool)
+	Readdir(ino uint64) ([]index.DirEntry, error)
+	GetExtents(ino uint64) ([]index.Extent, bool)
+	GetSymlink(ino uint64) (string, bool)
+	GetXattrs(ino uint64) map[string]string
+	GetParentIno(ino uint64) uint64
+	BlockSz() int32
+	UsedBytes() int64
+
+	SetAttr(ino uint64, mode, uid, gid *uint32, size *int64, atime, mtime *int64, now int64) error
+	CreateInode(fileType index.FileType, mode, uid, gid, rdev uint32, now int64) (uint64, error)
+	AddDirEntry(parentIno uint64, name string, childIno uint64, now int64) error
+	RemoveDirEntry(parentIno uint64, name string, now int64) error
+	Rename(srcParent uint64, srcName string, dstParent uint64, dstName string, now int64) error
+	WriteExtent(ino uint64, ext index.Extent, now int64) error
+	SetSymlink(ino uint64, target string, now int64) error
+	SetXattr(ino uint64, name, value string, now int64) error
+	RemoveXattr(ino uint64, name string, now int64) error
+	TouchAtime(ino uint64, now int64)
+}
+
 // Fusey is the top-level filesystem object shared by all nodes and file handles.
 type Fusey struct {
-	idx       *index.Index
+	idx       FSIndex
 	cs        *chunks.ChunkStore
 	maxFSSize int64  // total capacity in bytes, reported via statfs
 	cacheDir  string // directory where index snapshots are persisted on Fsync
+	readOnly  bool   // when true, the FUSE mount is read-only (used by as-of mounts)
 }
 
 // New creates a Fusey filesystem.
 // maxFSSize is FUSEY_MAX_SIZE; cacheDir is FUSEY_CACHE_DIR.
-func New(idx *index.Index, cs *chunks.ChunkStore, maxFSSize int64, cacheDir string) *Fusey {
-	return &Fusey{idx: idx, cs: cs, maxFSSize: maxFSSize, cacheDir: cacheDir}
+// When readOnly is true the underlying FUSE mount is opened with
+// ReadOnly=true, which makes all write operations return EROFS at the
+// kernel level. The idx is typically a *journal.JournaledIndex when
+// journal recording is enabled, or *index.Index when it is not.
+func New(idx FSIndex, cs *chunks.ChunkStore, maxFSSize int64, cacheDir string, readOnly bool) *Fusey {
+	return &Fusey{idx: idx, cs: cs, maxFSSize: maxFSSize, cacheDir: cacheDir, readOnly: readOnly}
 }
+
+// IsReadOnly returns whether this filesystem was mounted read-only. Used
+// by the FUSE layer to short-circuit write operations with EROFS before
+// the kernel rejects them, producing better error messages.
+func (f *Fusey) IsReadOnly() bool { return f.readOnly }
 
 // Root returns the root node for mounting.
 func (f *Fusey) Root() *Node {
@@ -507,7 +545,16 @@ func (fh *FileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 		return syscall.EIO
 	}
 	if fh.f.cacheDir != "" {
-		if err := index.Save(fh.f.idx, fh.f.cacheDir); err != nil {
+		// Save the underlying index. FUSE holds an FSIndex interface;
+		// both *index.Index and *journal.JournaledIndex have the Save
+		// method on the inner index, so we unwrap the wrapper if needed.
+		var raw *index.Index
+		if w, ok := fh.f.idx.(interface{ Inner() *index.Index }); ok {
+			raw = w.Inner()
+		} else {
+			raw = fh.f.idx.(*index.Index)
+		}
+		if err := index.Save(raw, fh.f.cacheDir); err != nil {
 			return syscall.EIO
 		}
 	}

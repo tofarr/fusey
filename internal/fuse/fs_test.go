@@ -28,7 +28,7 @@ func mountFSWithSize(t *testing.T, maxFSSize int64) (mnt, cacheDir string, clean
 	idx := index.New(4096)
 	cs := chunks.NewChunkStore(local, 64*1024*1024)
 	cacheDir = t.TempDir()
-	f := New(idx, cs, maxFSSize, cacheDir)
+	f := New(idx, cs, maxFSSize, cacheDir, false)
 
 	mnt = t.TempDir()
 	server, err := gofs.Mount(mnt, f.Root(), &gofs.Options{
