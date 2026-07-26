@@ -20,6 +20,10 @@ builds:
       - CGO_ENABLED=0
     ldflags:
       - -s -w
+      # Inject the goreleaser-derived version into the main.Version var declared
+      # in cmd/fusey/main.go so `fusey version` / `--version` report the real
+      # release tag instead of the default "dev".
+      - -X main.Version={{.Version}}
 
 archives:
   - formats: [tar.gz]
