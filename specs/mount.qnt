@@ -47,6 +47,38 @@
 //   up there. This is what makes the user's `fusey mount` failure diagnostic:
 //   instead of go-fuse's cryptic "fusermount exited with code 256" you also
 //   get the kernel syscall error (EPERM, EACCES, EBUSY, ...) in mount.log.
+//
+// CLI dispatch surface:
+//
+//   cmd/fusey/main.go's main() dispatches on os.Args[1] (with `--version`/
+//   `-v` checked before any other argument validation). The full surface it
+//   recognises, as of this writing, is:
+//
+//     Subcommand     Handler / path              Modeled by this spec?
+//     -----------    -----------------------     ---------------------
+//     mount          runMount                    YES (parent/daemon lifecycle below)
+//     daemon         runDaemon (internal)        YES (parent/daemon lifecycle below)
+//     unmount        runUnmount                  YES (signals the daemon via unmountCommandSendsSignal)
+//     compact        runCompact                  NO  — background maintenance; out of scope here
+//     version        print Version and exit 0    NO  — CLI introspection; pure side-effect-free printer
+//
+//     Top-level flag Handler                     Modeled by this spec?
+//     -------------  -----------------------     ---------------------
+//     --version      print Version and exit 0    NO  — same path as `version` subcommand
+//     -v             print Version and exit 0    NO  — same path as `version` subcommand
+//
+//   The `compact`, `version`, `--version`, and `-v` paths are intentionally NOT
+//   modeled by this spec: they do not transition any state in the parent/daemon
+//   lifecycle. Their non-interference with the modeled invariants is enforced
+//   structurally — `cmd/fusey/main_test.go::TestVersionSubcommand` and the
+//   (existing) subprocess-based integration tests cover the Go side, and the
+//   dispatch arms `return` before this spec's `init` action (or any lifecycle
+//   action) is ever reached.
+//
+//   Should a future change ever couple one of these paths to the lifecycle
+//   (e.g. by having `compact` re-flush through this state machine, or by making
+//   `version` consult on-disk state), the addition here is where the
+//   corresponding quint action, invariant, and state variable would land.
 
 module mount {
 

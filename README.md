@@ -261,6 +261,13 @@ export FUSEY_ACCESS_KEY=... FUSEY_SECRET_KEY=... FUSEY_FORCE_PATH_STYLE=true
 
 # Run a compaction cycle (e.g. from a CronJob)
 ./fusey compact
+
+# Print the fusey version and exit. This is the recommended way to
+# identify which fusey release is running in a container
+# (e.g. `kubectl exec $pod -- fusey version`).
+./fusey version
+# fusey v0.0.12          # the v0.0.12 release is installed
+# fusey dev             # built from `go build` / `go run` without release ldflags
 ```
 
 ### Test
