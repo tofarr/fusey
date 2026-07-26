@@ -5,6 +5,9 @@
 //	fusey mount <mountpoint>    — start a background daemon; exits when mount is operational
 //	fusey unmount <mountpoint>  — terminate the daemon serving the given mountpoint
 //	fusey compact               — run one compaction cycle and exit
+//	fusey version               — print the fusey version and exit
+//
+// `fusey --version` and `fusey -v` are also accepted as a shorthand for `fusey version`.
 //
 // All configuration is via FUSEY_* environment variables (see README).
 // Each mount gets its own subdirectory under FUSEY_CACHE_DIR named by a random
@@ -44,9 +47,29 @@ type daemonInfo struct {
 	Mountpoint string `json:"mountpoint"`
 }
 
+// Version is the semantic version of fusey. It is overridden at build time
+// by goreleaser via
+//
+//	go build -ldflags "-X main.Version={{ .Version }}"
+//
+// (see .goreleaser.yaml) and remains "dev" when building from source
+// (`go build`, `go run`, `go test`) so the `fusey version` subcommand and
+// `fusey --version` / `fusey -v` flags can be exercised in tests without
+// a release build. ldflags can only override `var` declarations, not `const`.
+var Version = "dev"
+
 func main() {
+	// Top-level version flags — checked before any other argument validation,
+	// so they work regardless of which (if any) subcommand follows. This mirrors
+	// the conventions of `kubectl version`, `docker version`, etc., and means
+	// installed binaries are unambiguously identifiable when called from
+	// outside (e.g. `kubectl exec ... -- fusey --version`).
+	if len(os.Args) >= 2 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Printf("fusey %s\n", Version)
+		return
+	}
 	if len(os.Args) < 2 {
-		log.Fatal("usage: fusey <mount|unmount|compact> [args]")
+		log.Fatal("usage: fusey <mount|unmount|compact|version> [args]")
 	}
 	switch os.Args[1] {
 	case "mount":
@@ -66,8 +89,10 @@ func main() {
 		runUnmount(os.Args[2])
 	case "compact":
 		runCompact()
+	case "version":
+		fmt.Printf("fusey %s\n", Version)
 	default:
-		log.Fatalf("unknown subcommand %q; use 'mount', 'unmount', or 'compact'", os.Args[1])
+		log.Fatalf("unknown subcommand %q; use 'mount', 'unmount', 'compact', or 'version'", os.Args[1])
 	}
 }
 
