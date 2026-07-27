@@ -208,7 +208,7 @@ func runDaemon(daemonID, mountpoint string) {
 	server, err := gofs.Mount(mountpoint, f.Root(), &gofs.Options{
 		MountOptions: fuse.MountOptions{
 			FsName:      "fusey",
-			AllowOther:  false,
+			AllowOther:  cfg.AllowOther,
 			DirectMount: true,
 		},
 	})

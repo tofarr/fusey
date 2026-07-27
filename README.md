@@ -199,6 +199,7 @@ as a Kubernetes container without config files.
 | `FUSEY_PREFIX` | _(none)_ | Key prefix for all objects in the bucket (e.g. `pod-abc/`). Use this to share one bucket across multiple Fusey instances |
 | `FUSEY_COMPACTION_THRESHOLD` | `0.3` | Orphan fraction above which a chunk is targeted by `fusey compact` |
 | `FUSEY_PERSIST_INTERVAL` | `30s` | How often the index is flushed to disk and the object store |
+| `FUSEY_ALLOW_OTHER` | `true` | When `true`, fusey mounts with the FUSE `allow_other` option so any user on the host can access the mountpoint. When `false`, only the UID that called `mount(2)` (the fusey daemon) can access it (the FUSE default). The default is `true` because fusey's typical deployment runs the daemon as root while the consumer (e.g. an agent-server) runs as a non-root user; without `allow_other` the kernel rejects the consumer's VFS operations before fusey's permission code runs. Set `FUSEY_ALLOW_OTHER=false` to restore the FUSE default if you need to restrict access to the mounter's UID. |
 
 ### Broker store (alternative to direct S3)
 
