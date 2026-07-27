@@ -25,6 +25,17 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.CompactionThreshold != DefaultCompactionThreshold {
 		t.Errorf("CompactionThreshold: got %f, want %f", cfg.CompactionThreshold, DefaultCompactionThreshold)
 	}
+	// AllowOther defaults to true: fusey's typical deployment runs the
+	// daemon as root (because the container is privileged and the
+	// mounter needs CAP_SYS_ADMIN) while the consumer (agent-server)
+	// runs as a non-root user. Without allow_other, the kernel rejects
+	// the consumer's VFS operations on the mount.
+	if cfg.AllowOther != DefaultAllowOther {
+		t.Errorf("AllowOther: got %v, want %v", cfg.AllowOther, DefaultAllowOther)
+	}
+	if cfg.AllowOther != true {
+		t.Errorf("AllowOther: got %v, want true (default must be true)", cfg.AllowOther)
+	}
 }
 
 func TestLoadEnvOverrides(t *testing.T) {
@@ -36,6 +47,7 @@ func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("FUSEY_ENDPOINT", "https://s3.example.com")
 	t.Setenv("FUSEY_COMPACTION_THRESHOLD", "0.5")
 	t.Setenv("FUSEY_PERSIST_INTERVAL", "60s")
+	t.Setenv("FUSEY_ALLOW_OTHER", "false")
 
 	cfg, err := Load()
 	if err != nil {
@@ -65,6 +77,9 @@ func TestLoadEnvOverrides(t *testing.T) {
 	if cfg.PersistInterval != 60*time.Second {
 		t.Errorf("PersistInterval: got %s", cfg.PersistInterval)
 	}
+	if cfg.AllowOther != false {
+		t.Errorf("AllowOther: got %v, want false (FUSEY_ALLOW_OTHER=false)", cfg.AllowOther)
+	}
 }
 
 func TestLoadBadValues(t *testing.T) {
@@ -74,6 +89,7 @@ func TestLoadBadValues(t *testing.T) {
 		{"FUSEY_MAX_SIZE", "notanumber"},
 		{"FUSEY_COMPACTION_THRESHOLD", "notafloat"},
 		{"FUSEY_PERSIST_INTERVAL", "notaduration"},
+		{"FUSEY_ALLOW_OTHER", "yes"},
 	}
 	for _, c := range cases {
 		t.Run(c.key, func(t *testing.T) {
@@ -91,5 +107,35 @@ func TestMaxFSSizeZeroIsInvalid(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Error("expected error for FUSEY_MAX_SIZE=0")
+	}
+}
+
+func TestLoadAllowOther(t *testing.T) {
+	// `1`, `t`, `T`, `TRUE`, `true`, `True` all parse to true per
+	// strconv.ParseBool. Covers the common opt-in spellings.
+	for _, v := range []string{"true", "True", "TRUE", "1"} {
+		t.Run("explicit_true_"+v, func(t *testing.T) {
+			t.Setenv("FUSEY_ALLOW_OTHER", v)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if !cfg.AllowOther {
+				t.Errorf("AllowOther: got %v, want true", cfg.AllowOther)
+			}
+		})
+	}
+
+	for _, v := range []string{"false", "False", "FALSE", "0"} {
+		t.Run("explicit_false_"+v, func(t *testing.T) {
+			t.Setenv("FUSEY_ALLOW_OTHER", v)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.AllowOther {
+				t.Errorf("AllowOther: got %v, want false", cfg.AllowOther)
+			}
+		})
 	}
 }
