@@ -48,6 +48,31 @@
 //   instead of go-fuse's cryptic "fusermount exited with code 256" you also
 //   get the kernel syscall error (EPERM, EACCES, EBUSY, ...) in mount.log.
 //
+// Configuration (resolved from environment variables at startup):
+//   FUSEY_ALLOW_OTHER    — controls the FUSE `allow_other` mount option
+//                          (default `true`). When `true`, fusey asks the
+//                          kernel for an `allow_other` mount so any user on
+//                          the host may access the mountpoint; when `false`,
+//                          only the UID that called `mount(2)` (the fusey
+//                          daemon) may access it — the FUSE default. fusey
+//                          defaults this to `true` because the typical
+//                          deployment runs the daemon as root (the mounter
+//                          needs `CAP_SYS_ADMIN`) while the consumer process
+//                          (e.g. an agent-server) runs as a non-root user;
+//                          without `allow_other` the kernel rejects the
+//                          consumer's VFS operations before fusey's own
+//                          permission code ever runs.
+//
+//   This spec does NOT model the lifecycle differently based on
+//   FUSEY_ALLOW_OTHER: the mount option is consumed by gofs.Mount at the
+//   DaemonStarting → DaemonReady transition and either succeeds (the
+//   mount is operational with the requested option) or fails
+//   (`daemonMountFails`) — and that second case covers, among other
+//   failure modes, the situation where the kernel refuses `allow_other`
+//   because `/etc/fuse.conf` does not enable `user_allow_other`. The
+//   `ALLOW_OTHER` constant below is the spec-level projection of the
+//   env var; invariants in this file hold for both values.
+//
 // CLI dispatch surface:
 //
 //   cmd/fusey/main.go's main() dispatches on os.Args[1] (with `--version`/
@@ -81,6 +106,19 @@
 //   corresponding quint action, invariant, and state variable would land.
 
 module mount {
+
+  // --------------------------------------------------------------------------
+  // Constants
+  // --------------------------------------------------------------------------
+
+  // Spec-level projection of the FUSEY_ALLOW_OTHER environment variable:
+  // when `true`, the daemon requests a FUSE `allow_other` mount so any user
+  // on the host may access the mountpoint; when `false`, only the UID that
+  // called `mount(2)` may access it. Modeled as a constant (not a state
+  // variable) because the value is read once from the environment at
+  // startup and does not change during the daemon's lifetime. See the
+  // preamble "Configuration" section for the rationale.
+  const ALLOW_OTHER: bool
 
   // --------------------------------------------------------------------------
   // Types
